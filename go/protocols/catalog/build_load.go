@@ -5,14 +5,14 @@ import (
 	"fmt"
 
 	pf "github.com/estuary/flow/go/protocols/flow"
-	_ "github.com/mattn/go-sqlite3" // Import for registration side-effect.
+	_ "github.com/lib/pq" // Import for registration side-effect.
 )
 
 // Extract is a convenience for testing. It opens a given catalog database,
 // ensures it built without errors, invokes the provided callback,
 // and then closes the database.
-func Extract(path string, fn func(db *sql.DB) error) error {
-	return extract(path, func(db *sql.DB) error {
+func Extract(connectionString string, fn func(db *sql.DB) error) error {
+	return extract(connectionString, func(db *sql.DB) error {
 		// Sanity-check that no build errors occurred.
 		if errors, err := LoadAllErrors(db); err != nil {
 			return fmt.Errorf("loading catalog errors: %w", err)
@@ -24,8 +24,8 @@ func Extract(path string, fn func(db *sql.DB) error) error {
 	})
 }
 
-func extract(path string, fn func(db *sql.DB) error) error {
-	var db, err = sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro", path))
+func extract(connectionString string, fn func(db *sql.DB) error) error {
+	var db, err = sql.Open("postgres", connectionString)
 	if err != nil {
 		return fmt.Errorf("opening DB: %w", err)
 	}

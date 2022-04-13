@@ -7,7 +7,6 @@ import (
 
 	"github.com/estuary/flow/go/flow/ops"
 	"github.com/estuary/flow/go/materialize/driver/image"
-	"github.com/estuary/flow/go/materialize/driver/sqlite"
 	pf "github.com/estuary/flow/go/protocols/flow"
 	pm "github.com/estuary/flow/go/protocols/materialize"
 )
@@ -22,8 +21,6 @@ func NewDriver(
 ) (pm.DriverClient, error) {
 
 	switch endpointType {
-	case pf.EndpointType_SQLITE:
-		return pm.AdaptServerToClient(sqlite.NewSQLiteDriver()), nil
 	case pf.EndpointType_FLOW_SINK:
 		return pm.AdaptServerToClient(image.NewDriver(connectorNetwork, logPublisher)), nil
 	default:

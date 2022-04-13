@@ -20,8 +20,14 @@ materializations:
   # since these don't get validated at the time of publishing.
   examples/stats:
     endpoint:
-      sqlite:
-        path: ../examples/examples.db?_journal=WAL
+      connector:
+        image: ghcr.io/estuary/materialize-postgres:dev
+        config:
+          host: localhost
+          port: 2345
+          user: flow
+          password: flow
+          database: flow
     bindings:
       - resource:
           table: flow_logs

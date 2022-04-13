@@ -15,11 +15,11 @@ func TestSQLGenerator(t *testing.T) {
 	var flowMaterializations = FlowMaterializationsTable(DefaultFlowMaterializations)
 	var allTables = []*Table{&testTable, flowCheckpoints, flowMaterializations}
 
-	var endpoint = NewStdEndpoint(nil, nil, SQLiteSQLGenerator(), FlowTables{})
+	var endpoint = NewStdEndpoint(nil, nil, PostgreSQLGenerator(), FlowTables{})
 
 	for _, table := range allTables {
 		// Test all the generic sql generation functions for each table
-		t.Run(fmt.Sprintf("sqlite_%s", table.Identifier), func(t *testing.T) {
+		t.Run(fmt.Sprintf("pg_%s", table.Identifier), func(t *testing.T) {
 			var createTable, err = endpoint.CreateTableStatement(table)
 			require.NoError(t, err)
 

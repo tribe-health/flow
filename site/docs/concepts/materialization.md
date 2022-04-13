@@ -212,24 +212,6 @@ materializations:
 
 [Learn more about partition selectors](./advanced/projections.md#partition-selectors).
 
-## SQLite endpoint
-
-In addition to materialization connectors, Flow offers a built-in SQLite endpoint
-for local testing and development. SQLite is not suitable for materializations
-running within a managed data plane.
-
-```yaml
-materializations:
-  acmeCo/example/database-views:
-    endpoint:
-      # A SQLite endpoint is specified using `sqlite` instead of `connector`.
-      sqlite:
-        # The SQLite endpoint requires the `path` of the SQLite database to use,
-        # specified as a file path. It may include URI query parameters;
-        # See: https://www.sqlite.org/uri.html and https://github.com/mattn/go-sqlite3#connection-string
-        path: example/database.sqlite?_journal_mode=WAL
-```
-
 ## Backpressure
 
 Flow processes updates in transactions, as quickly as the endpoint can handle them.

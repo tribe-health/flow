@@ -70,7 +70,7 @@ func (cmd apiBuild) execute(ctx context.Context) error {
 	// We manually open the database, rather than use catalog.Extract,
 	// because we explicitly check for and handle errors.
 	// Essentially all other accesses of the catalog DB should prefer catalog.Extract.
-	db, err := sql.Open("sqlite3", fmt.Sprintf("file://%s?mode=ro", args.OutputPath()))
+	db, err := sql.Open("postgres", fmt.Sprintf("postgres://%s", args.OutputPath()))
 	if err != nil {
 		return fmt.Errorf("opening DB: %w", err)
 	}

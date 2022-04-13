@@ -305,33 +305,6 @@ func QuestionMarkPlaceholder(_ int) string {
 	return "?"
 }
 
-// SQLiteSQLGenerator returns a SQLGenerator for the sqlite SQL dialect.
-func SQLiteSQLGenerator() Generator {
-	var typeMappings = ColumnTypeMapper{
-		INTEGER: RawConstColumnType("INTEGER"),
-		NUMBER:  RawConstColumnType("REAL"),
-		BOOLEAN: RawConstColumnType("BOOLEAN"),
-		OBJECT:  RawConstColumnType("TEXT"),
-		ARRAY:   RawConstColumnType("TEXT"),
-		BINARY:  RawConstColumnType("BLOB"),
-		STRING: StringTypeMapping{
-			Default: RawConstColumnType("TEXT"),
-		},
-	}
-	var nullable TypeMapper = NullableTypeMapping{
-		NotNullText: "NOT NULL",
-		Inner:       typeMappings,
-	}
-
-	return Generator{
-		CommentRenderer:    LineCommentRenderer(),
-		IdentifierRenderer: NewRenderer(nil, DoubleQuotesWrapper(), DefaultUnwrappedIdentifiers),
-		ValueRenderer:      NewRenderer(DefaultQuoteSanitizer, SingleQuotesWrapper(), nil),
-		Placeholder:        QuestionMarkPlaceholder,
-		TypeMappings:       nullable,
-	}
-}
-
 // QueryOnPrimaryKey generates a query that has a placeholder parameter for each primary key in
 // the order given in the table. Only selectColumns will be selected in the same order as
 // provided.

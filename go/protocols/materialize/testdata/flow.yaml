@@ -10,10 +10,16 @@ collections:
     key: [/key1, /key2]
 
 materializations:
-  test/sqlite:
+  test/pg:
     endpoint:
-      sqlite:
-        path: ":memory:"
+      connector:
+        image: ghcr.io/estuary/materialize-postgres:dev
+        config:
+          host: localhost
+          port: 5432
+          user: flow
+          password: flow
+          database: flow
     bindings:
       - source: key/value
         resource: { table: key_value }

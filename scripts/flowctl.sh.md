@@ -28,8 +28,5 @@ You should be able to use the command `flowctl` just as in the documentation. (S
 The script automatically detects where you are referencing your source file and data directories and maps those inside of the container.
 If your config references something outside of that directory, it may not be inside of the container and could be lost.
 
-For example, if you have an sqlite database path set to `../example.db` it will likely generate that database outside of the
-mapped directory in the container.
-
 * On MacOS it must run the container as root. This is due to how Docker for Mac manages permissions on the docker.sock file. Despite
 this, all files created by the container on the user's filesystem will be owned by the user (rather than root)

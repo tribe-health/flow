@@ -84,15 +84,17 @@ Each of the top-level catalog specs might import all of the collections and defi
 Our configuration for our development environment will look like:
 
 ```yaml title="dev.flow.yaml"
-  import:
+import:
   - customers/flow.yaml
   - products/flow.yaml
   - sales/flow.yaml
 
-  ourMaterializationEndpoint:
-    # dev.flow.yaml
-    sqlite:
-      path: dev-materializations.db
+materializations:
+  acmeCo/example/postgres:
+    endpoint:
+      connector:
+        image: ghcr.io/estuary/materialize-postgres:dev
+        config: path/to/connector-config.yaml
 ```
 
 While production will look like:
@@ -103,14 +105,18 @@ import:
   - products/flow.yaml
   - sales/flow.yaml
 
-endpoints:
-    snowflake:
-      account: acme_production
-      role: admin
-      schema: snowflake.com/acmeProd
-      user: importantAdmin
-      password: abc123
-      warehouse: acme_production
+materializations:
+  acmeCo/production/snowflake:
+    endpoint:
+      connector:
+        image: ghcr.io/estuary/materialize-snowflake:dev
+        config:
+          account: acme_production
+          role: admin
+          schema: snowflake.com/acmeProd
+          user: importantAdmin
+          password: abc123
+          warehouse: acme_production
 ```
 
 When we want to test locally, we simply run `flowctl test dev.flow.yaml` and when we push to production we'll likely run `flowctl apply prod.flow.yaml`.

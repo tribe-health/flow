@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/bradleyjkemp/cupaloy"
-	_ "github.com/mattn/go-sqlite3" // Import for register side-effects.
+	_ "github.com/lib/pq" // Import for register side-effects.
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,13 +16,13 @@ func TestStdEndpointFencingCases(t *testing.T) {
 	// runTest takes zero or more key range fixtures, followed by a final pair
 	// which is the key range under test.
 	var runTest = func(t *testing.T, ranges ...uint32) {
-		var db, err = sql.Open("sqlite3", ":memory:")
+		var db, err = sql.Open("postgres", "host=localhost port=5432 user=postgres password=postgres dbname=flow")
 		require.NoError(t, err)
 
 		ctx := context.Background()
 
 		// Leverage the Endpoint interface
-		var endpoint Endpoint = NewStdEndpoint(nil, db, SQLiteSQLGenerator(), DefaultFlowTables(""))
+		var endpoint Endpoint = NewStdEndpoint(nil, db, PostgreSQLGenerator(), DefaultFlowTables(""))
 
 		sql, err := endpoint.CreateTableStatement(endpoint.FlowTables().Checkpoints)
 		require.NoError(t, err)
