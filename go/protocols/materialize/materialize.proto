@@ -487,12 +487,16 @@ message TransactionRequest {
   }
   Load load = 2;
 
-  // Prepare to commit. No further Loads will be sent in this transaction.
-  message Prepare {
+  // Flush loads. No further Loads will be sent in this transaction,
+  // and the client will await the driver's remaining Loaded responses
+  // followed by one Flushed response.
+  message Flush {
     // Flow checkpoint to commit with this transaction.
-    bytes flow_checkpoint = 1;
+    // This is being removed, in favor of instead sending
+    // StartCommit.flow_checkpoint
+    bytes deprecated_flow_checkpoint = 1;
   }
-  Prepare prepare = 3;
+  Flush flush = 3;
 
   // Store documents of this transaction commit.
   message Store {
@@ -512,10 +516,13 @@ message TransactionRequest {
   }
   Store store = 4;
 
-  // Mark the end of the Store phase, and if the remote store is authoritative,
-  // instruct it to commit its transaction.
-  message Commit {}
-  Commit commit = 5;
+  // Mark end of the Store phase, and instruct the driver to begin committing
+  // its transaction (if it has one).
+  message StartCommit {
+    // Flow checkpoint to commit with this transaction.
+    bytes flow_checkpoint = 1;
+  }
+  StartCommit start_commit = 5;
 
   // Notify the driver that the previous transaction has committed to the Flow
   // runtime's recovery log.
@@ -556,27 +563,24 @@ message TransactionResponse {
   }
   Loaded loaded = 2;
 
-  // Prepared responds to a TransactionRequest.Prepare of the client.
-  // No further Loaded responses will be sent.
-  flow.DriverCheckpoint prepared = 3;
+  // Flushed responds to a TransactionRequest.Flush of the client.
+  // The driver will send no further Loaded responses.
+  // The DriverCheckpoint body is being deprecated and will be
+  // replaced with an empty message Flushed{}.
+  flow.DriverCheckpoint flushed = 3;
 
-  // Mark the end of the Store phase, indicating that all documents have been
-  // fully stored.
-  //
-  // If the remote store is authoritative, tell the Flow runtime that it has
-  // committed.
-  //
-  // If the recovery log is authoritative, DriverCommitted is sent but no actual
-  // transactional driver commit is performed.
-  message DriverCommitted {}
-  DriverCommitted driver_committed = 4;
+  // StartedCommit responds to a TransactionRequest.StartCommit of the client.
+  // The driver has processed all Store requests, it has started to commit its
+  // transaction (if it has one), and it is now ready for the runtime to start
+  // committing to its own recovery log.
+  message StartedCommit {
+    flow.DriverCheckpoint driver_checkpoint = 1;
+  }
+  StartedCommit started_commit = 4;
 
-  // Notify the Flow runtime of receipt of it's confirmation that the
-  // Flow recovery log has committed.
-  //
-  // If the driver utilizes staged data which is idempotently applied,
-  // it must apply staged data of the commit at this time, and respond
-  // with Acknowledged only once that's completed.
+  // Acknowledged responds to a TransactionRequest.Acknowledge of the client.
+  // The driver has fully committed its transaction (if it has one),
+  // and is ready to begin the next.
   message Acknowledged {}
   Acknowledged acknowledged = 5;
 }

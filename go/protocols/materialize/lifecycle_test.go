@@ -19,19 +19,24 @@ func TestStreamLifecycle(t *testing.T) {
 	var staged *TransactionRequest
 	var staged2 *TransactionResponse
 
-	// Runtime sends Load mixed with Acknowledge, followed by Prepare.
+	// Runtime sends Acknowledge.
+	require.NoError(t, WriteAcknowledge(sendFn, &staged))
+	// Driver responds with Acknowledged.
+	require.NoError(t, WriteAcknowledged(recvFn, &staged2))
+
+	// Runtime sends multiple Loads, then Flush.
+	require.NoError(t, WriteAcknowledge(sendFn, &staged))
 	require.NoError(t, StageLoad(sendFn, &staged, 0, tuple.Tuple{"key-1"}.Pack()))
 	require.NoError(t, StageLoad(sendFn, &staged, 1, tuple.Tuple{2}.Pack()))
 	require.NoError(t, StageLoad(sendFn, &staged, 1, tuple.Tuple{-3}.Pack()))
-	require.NoError(t, WriteAcknowledge(sendFn, &staged))
 	require.NoError(t, StageLoad(sendFn, &staged, 1, tuple.Tuple{"four"}.Pack()))
 	require.NoError(t, StageLoad(sendFn, &staged, 3, tuple.Tuple{[]byte("five")}.Pack()))
-	require.NoError(t, WritePrepare(sendFn, &staged, pf.Checkpoint{
-		AckIntents: map[pf.Journal][]byte{"foo": nil}}))
+	require.NoError(t, WriteFlush(sendFn, &staged,
+		// Deprecated checkpoint, to be removed.
+		pf.Checkpoint{AckIntents: map[pf.Journal][]byte{"deprecated": nil}}))
 
 	// Driver reads Loads.
-	var reqAckCh = make(chan struct{})
-	var it = &LoadIterator{stream: recvFn, reqAckCh: reqAckCh}
+	var it = &LoadIterator{stream: recvFn}
 	require.True(t, it.Next())
 	require.Equal(t, tuple.Tuple{"key-1"}, it.Key)
 	require.True(t, it.Next())
@@ -40,30 +45,28 @@ func TestStreamLifecycle(t *testing.T) {
 	require.Equal(t, tuple.Tuple{int64(-3)}, it.Key)
 	require.True(t, it.Next())
 	require.Equal(t, tuple.Tuple{"four"}, it.Key)
-	<-reqAckCh // Expect channel was signaled.
-	require.NoError(t, WriteAcknowledged(recvFn, &staged2))
+
 	require.True(t, it.Next())
 	require.Equal(t, tuple.Tuple{[]byte("five")}, it.Key)
 
 	require.False(t, it.Next())
 	require.Nil(t, it.Err())
-	require.NotEmpty(t, it.Prepare().FlowCheckpoint)
 
-	// Driver responds with Loaded, then Prepared.
+	// Driver responds with Loaded, then Flushed.
 	require.NoError(t, StageLoaded(recvFn, &staged2, 0, []byte(`loaded-1`)))
 	require.NoError(t, StageLoaded(recvFn, &staged2, 0, []byte(`loaded-2`)))
 	require.NoError(t, StageLoaded(recvFn, &staged2, 2, []byte(`loaded-3`)))
-	require.NoError(t, WritePrepared(recvFn, &staged2,
-		pf.DriverCheckpoint{DriverCheckpointJson: []byte(`checkpoint`)}))
+	require.NoError(t, WriteFlushed(recvFn, &staged2))
 
-	// Runtime sends Store, then Commit.
+	// Runtime sends Store, then StartCommit with runtime checkpoint.
 	require.NoError(t, StageStore(sendFn, &staged,
 		0, tuple.Tuple{"key-1"}.Pack(), tuple.Tuple{false}.Pack(), []byte(`doc-1`), true))
 	require.NoError(t, StageStore(sendFn, &staged,
 		0, tuple.Tuple{"key", 2}.Pack(), tuple.Tuple{"two"}.Pack(), []byte(`doc-2`), false))
 	require.NoError(t, StageStore(sendFn, &staged,
 		1, tuple.Tuple{"three"}.Pack(), tuple.Tuple{true}.Pack(), []byte(`doc-3`), true))
-	require.NoError(t, WriteCommit(sendFn, &staged))
+	require.NoError(t, WriteStartCommit(sendFn, &staged, pf.Checkpoint{
+		AckIntents: map[pf.Journal][]byte{"foo": nil}}))
 
 	// Driver reads stores.
 	var sit = &StoreIterator{stream: recvFn}
@@ -90,10 +93,11 @@ func TestStreamLifecycle(t *testing.T) {
 
 	require.False(t, sit.Next())
 	require.Nil(t, sit.Err())
-	require.Equal(t, &TransactionRequest_Commit{}, sit.Commit())
+	require.NotEmpty(t, sit.StartCommit().FlowCheckpoint)
 
-	// Driver sends DriverCommitted.
-	require.NoError(t, WriteDriverCommitted(recvFn, &staged2))
+	// Driver sends StartedCommit.
+	require.NoError(t, WriteStartedCommit(recvFn, &staged2,
+		pf.DriverCheckpoint{DriverCheckpointJson: []byte(`checkpoint`)}))
 
 	// Snapshot to verify driver responses.
 	cupaloy.SnapshotT(t, stream.resp)

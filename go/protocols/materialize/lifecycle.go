@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/estuary/flow/go/protocols/fdb/tuple"
+	"github.com/estuary/flow/go/protocols/flow"
 	pf "github.com/estuary/flow/go/protocols/flow"
 	pc "go.gazette.dev/core/consumer/protocol"
 )
@@ -95,14 +96,14 @@ func StageLoaded(
 	return nil
 }
 
-// WritePrepare flushes a pending Load request, and sends a Prepare request
-// with the provided Flow checkpoint.
-func WritePrepare(
+// WriteFlush flushes a pending Load request, and sends a Flush request
+// with the provided (deprecated) Flow checkpoint.
+func WriteFlush(
 	stream interface {
 		Send(*TransactionRequest) error
 	},
 	request **TransactionRequest,
-	checkpoint pc.Checkpoint,
+	deprecatedCheckpoint pc.Checkpoint,
 ) error {
 	// Flush partial Load request, if required.
 	if *request != nil {
@@ -112,30 +113,28 @@ func WritePrepare(
 		*request = nil
 	}
 
-	var checkpointBytes, err = checkpoint.Marshal()
+	var checkpointBytes, err = deprecatedCheckpoint.Marshal()
 	if err != nil {
 		panic(err) // Cannot fail.
 	}
 
 	if err := stream.Send(&TransactionRequest{
-		Prepare: &TransactionRequest_Prepare{
-			FlowCheckpoint: checkpointBytes,
+		Flush: &TransactionRequest_Flush{
+			DeprecatedFlowCheckpoint: checkpointBytes,
 		},
 	}); err != nil {
-		return fmt.Errorf("sending Prepare request: %w", err)
+		return fmt.Errorf("sending Flush request: %w", err)
 	}
 
 	return nil
 }
 
-// WritePrepared flushes a pending Loaded response, and sends a Prepared response
-// with the provided driver checkpoint.
-func WritePrepared(
+// WriteFlushed flushes a pending Loaded response, and sends a Flushed response.
+func WriteFlushed(
 	stream interface {
 		Send(*TransactionResponse) error
 	},
 	response **TransactionResponse,
-	checkpoint pf.DriverCheckpoint,
 ) error {
 	// Flush partial Loaded response, if required.
 	if *response != nil {
@@ -145,8 +144,10 @@ func WritePrepared(
 		*response = nil
 	}
 
-	if err := stream.Send(&TransactionResponse{Prepared: &checkpoint}); err != nil {
-		return fmt.Errorf("sending Prepared response: %w", err)
+	if err := stream.Send(&TransactionResponse{
+		Flushed: &flow.DriverCheckpoint{},
+	}); err != nil {
+		return fmt.Errorf("sending Flushed response: %w", err)
 	}
 
 	return nil
@@ -202,12 +203,13 @@ func StageStore(
 	return nil
 }
 
-// WriteCommit flushes a pending Store request, and sends a Commit request.
-func WriteCommit(
+// WriteStartCommit flushes a pending Store request, and sends a StartCommit request.
+func WriteStartCommit(
 	stream interface {
 		Send(*TransactionRequest) error
 	},
 	request **TransactionRequest,
+	checkpoint pc.Checkpoint,
 ) error {
 	// Flush partial Store request, if required.
 	if *request != nil {
@@ -217,21 +219,29 @@ func WriteCommit(
 		*request = nil
 	}
 
+	var checkpointBytes, err = checkpoint.Marshal()
+	if err != nil {
+		panic(err) // Cannot fail.
+	}
+
 	if err := stream.Send(&TransactionRequest{
-		Commit: &TransactionRequest_Commit{},
+		StartCommit: &TransactionRequest_StartCommit{
+			FlowCheckpoint: checkpointBytes,
+		},
 	}); err != nil {
-		return fmt.Errorf("sending Commit request: %w", err)
+		return fmt.Errorf("sending StartCommit request: %w", err)
 	}
 
 	return nil
 }
 
-// WriteDriverCommitted writes a DriverCommitted response to the stream.
-func WriteDriverCommitted(
+// WriteStartedCommit writes a StartedCommit response to the stream.
+func WriteStartedCommit(
 	stream interface {
 		Send(*TransactionResponse) error
 	},
 	response **TransactionResponse,
+	checkpoint pf.DriverCheckpoint,
 ) error {
 	// We must have sent Prepared prior to DriverCommitted.
 	if *response != nil {
@@ -239,9 +249,11 @@ func WriteDriverCommitted(
 	}
 
 	if err := stream.Send(&TransactionResponse{
-		DriverCommitted: &TransactionResponse_DriverCommitted{},
+		StartedCommit: &TransactionResponse_StartedCommit{
+			DriverCheckpoint: &checkpoint,
+		},
 	}); err != nil {
-		return fmt.Errorf("sending DriverCommitted response: %w", err)
+		return fmt.Errorf("sending StartedCommit response: %w", err)
 	}
 
 	return nil
@@ -254,8 +266,8 @@ func WriteAcknowledge(
 	},
 	request **TransactionRequest,
 ) error {
-	if *request != nil && (*request).Load == nil {
-		panic("expected nil or Load request")
+	if *request != nil {
+		panic("expected nil request")
 	}
 
 	if err := stream.Send(&TransactionRequest{
@@ -274,10 +286,9 @@ func WriteAcknowledged(
 	},
 	response **TransactionResponse,
 ) error {
-	// We must have sent DriverCommitted prior to Acknowledged.
-	// Acknowledged may be intermixed with Loaded.
-	if *response != nil && (*response).Loaded == nil {
-		panic("expected response to be nil or have staged Loaded responses")
+	// We must have sent StartedCommit prior to Acknowledged.
+	if *response != nil {
+		panic("expected nil response")
 	}
 
 	if err := stream.Send(&TransactionResponse{
@@ -298,16 +309,15 @@ type LoadIterator struct {
 		Context() context.Context
 		RecvMsg(m interface{}) error // Receives Load, Acknowledge, and Prepare.
 	}
-	reqAckCh chan<- struct{}    // Closed and nil'd on reading Acknowledge.
-	req      TransactionRequest // Last read request.
-	index    int                // Last-returned document index within |req|.
-	total    int                // Total number of iterated keys.
-	err      error              // Final error.
+	req   TransactionRequest // Last read request.
+	index int                // Last-returned document index within |req|.
+	total int                // Total number of iterated keys.
+	err   error              // Final error.
 }
 
 // NewLoadIterator returns a *LoadIterator of the stream.
-func NewLoadIterator(stream Driver_TransactionsServer, reqAckCh chan<- struct{}) *LoadIterator {
-	return &LoadIterator{stream: stream, reqAckCh: reqAckCh}
+func NewLoadIterator(stream Driver_TransactionsServer) *LoadIterator {
+	return &LoadIterator{stream: stream}
 }
 
 // poll returns true if there is at least one LoadRequest message with at least one key
@@ -317,7 +327,7 @@ func NewLoadIterator(stream Driver_TransactionsServer, reqAckCh chan<- struct{})
 // remaining keys and poll must not be called again. Note that if poll returns
 // true, then Next may still return false if the LoadRequest message is malformed.
 func (it *LoadIterator) poll() bool {
-	if it.err != nil || it.req.Prepare != nil {
+	if it.err != nil || it.req.Flush != nil {
 		panic("Poll called again after having returned false")
 	}
 
@@ -328,8 +338,6 @@ func (it *LoadIterator) poll() bool {
 		if err := it.stream.RecvMsg(&it.req); err == io.EOF {
 			if it.total != 0 {
 				it.err = fmt.Errorf("unexpected EOF when there are loaded keys")
-			} else if it.reqAckCh != nil {
-				it.err = fmt.Errorf("unexpected EOF before receiving Acknowledge")
 			} else {
 				it.err = io.EOF // Clean shutdown
 			}
@@ -339,20 +347,8 @@ func (it *LoadIterator) poll() bool {
 			return false
 		}
 
-		if it.req.Acknowledge != nil {
-			if it.reqAckCh == nil {
-				it.err = fmt.Errorf("protocol error (Acknowledge seen twice during load phase)")
-				return false
-			}
-			close(it.reqAckCh) // Signal that Acknowledge should run.
-			it.reqAckCh = nil
-
-			return it.poll() // Tail-recurse to read the next message.
-		} else if it.req.Prepare != nil {
-			if it.reqAckCh != nil {
-				it.err = fmt.Errorf("protocol error (Prepare seen before Acknowledge)")
-			}
-			return false // Prepare ends the Load phase.
+		if it.req.Flush != nil {
+			return false // Flush ends the Load phase.
 		} else if it.req.Load == nil || len(it.req.Load.PackedKeys) == 0 {
 			it.err = fmt.Errorf("protocol error (expected non-empty Load, got %#v)", it.req)
 			return false
@@ -392,12 +388,6 @@ func (it *LoadIterator) Err() error {
 	return it.err
 }
 
-// Prepare returns a TransactionRequest_Prepare which caused this LoadIterator
-// to terminate. It's valid only after Next returns false and Err is nil.
-func (it *LoadIterator) Prepare() *TransactionRequest_Prepare {
-	return it.req.Prepare
-}
-
 // StoreIterator is an iterator over Store requests.
 type StoreIterator struct {
 	Binding int             // Binding index of this stored document.
@@ -428,7 +418,7 @@ func NewStoreIterator(stream Driver_TransactionsServer) *StoreIterator {
 // are no remaining documents and poll must not be called again. Note that if poll returns true,
 // then Next may still return false if the StoreRequest message is malformed.
 func (it *StoreIterator) poll() bool {
-	if it.err != nil || it.req.Commit != nil {
+	if it.err != nil || it.req.StartCommit != nil {
 		panic("Poll called again after having returned false")
 	}
 	// Must we read another request?
@@ -440,8 +430,8 @@ func (it *StoreIterator) poll() bool {
 			return false
 		}
 
-		if it.req.Commit != nil {
-			return false // Prepare ends the Store phase.
+		if it.req.StartCommit != nil {
+			return false // StartCommit ends the Store phase.
 		} else if it.req.Store == nil || len(it.req.Store.PackedKeys) == 0 {
 			it.err = fmt.Errorf("expected non-empty Store, got %#v", it.req)
 			return false
@@ -488,10 +478,10 @@ func (it *StoreIterator) Err() error {
 	return it.err
 }
 
-// Commit returns a TransactionRequest_Commit which caused this StoreIterator
+// StartCommit returns a TransactionRequest_StartCommit which caused this StoreIterator
 // to terminate. It's valid only after Next returns false and Err is nil.
-func (it *StoreIterator) Commit() *TransactionRequest_Commit {
-	return it.req.Commit
+func (it *StoreIterator) StartCommit() *TransactionRequest_StartCommit {
+	return it.req.StartCommit
 }
 
 const (

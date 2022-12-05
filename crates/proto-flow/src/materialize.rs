@@ -185,11 +185,11 @@ pub struct TransactionRequest {
     #[prost(message, optional, tag="2")]
     pub load: ::core::option::Option<transaction_request::Load>,
     #[prost(message, optional, tag="3")]
-    pub prepare: ::core::option::Option<transaction_request::Prepare>,
+    pub flush: ::core::option::Option<transaction_request::Flush>,
     #[prost(message, optional, tag="4")]
     pub store: ::core::option::Option<transaction_request::Store>,
     #[prost(message, optional, tag="5")]
-    pub commit: ::core::option::Option<transaction_request::Commit>,
+    pub start_commit: ::core::option::Option<transaction_request::StartCommit>,
     #[prost(message, optional, tag="6")]
     pub acknowledge: ::core::option::Option<transaction_request::Acknowledge>,
 }
@@ -247,12 +247,16 @@ pub mod transaction_request {
         #[prost(message, repeated, tag="3")]
         pub packed_keys: ::prost::alloc::vec::Vec<super::super::flow::Slice>,
     }
-    /// Prepare to commit. No further Loads will be sent in this transaction.
+    /// Flush loads. No further Loads will be sent in this transaction,
+    /// and the client will await the driver's remaining Loaded responses
+    /// followed by one Flushed response.
     #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct Prepare {
+    pub struct Flush {
         /// Flow checkpoint to commit with this transaction.
+        /// This is being removed, in favor of instead sending
+        /// StartCommit.flow_checkpoint
         #[prost(bytes="vec", tag="1")]
-        pub flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
+        pub deprecated_flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
     }
     /// Store documents of this transaction commit.
     #[derive(Clone, PartialEq, ::prost::Message)]
@@ -276,10 +280,13 @@ pub mod transaction_request {
         #[prost(bool, repeated, tag="6")]
         pub exists: ::prost::alloc::vec::Vec<bool>,
     }
-    /// Mark the end of the Store phase, and if the remote store is authoritative,
-    /// instruct it to commit its transaction.
+    /// Mark end of the Store phase, and instruct the driver to begin committing
+    /// its transaction (if it has one).
     #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct Commit {
+    pub struct StartCommit {
+        /// Flow checkpoint to commit with this transaction.
+        #[prost(bytes="vec", tag="1")]
+        pub flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
     }
     /// Notify the driver that the previous transaction has committed to the Flow
     /// runtime's recovery log.
@@ -296,12 +303,14 @@ pub struct TransactionResponse {
     pub opened: ::core::option::Option<transaction_response::Opened>,
     #[prost(message, optional, tag="2")]
     pub loaded: ::core::option::Option<transaction_response::Loaded>,
-    /// Prepared responds to a TransactionRequest.Prepare of the client.
-    /// No further Loaded responses will be sent.
+    /// Flushed responds to a TransactionRequest.Flush of the client.
+    /// The driver will send no further Loaded responses.
+    /// The DriverCheckpoint body is being deprecated and will be
+    /// replaced with an empty message Flushed{}.
     #[prost(message, optional, tag="3")]
-    pub prepared: ::core::option::Option<super::flow::DriverCheckpoint>,
+    pub flushed: ::core::option::Option<super::flow::DriverCheckpoint>,
     #[prost(message, optional, tag="4")]
-    pub driver_committed: ::core::option::Option<transaction_response::DriverCommitted>,
+    pub started_commit: ::core::option::Option<transaction_response::StartedCommit>,
     #[prost(message, optional, tag="5")]
     pub acknowledged: ::core::option::Option<transaction_response::Acknowledged>,
 }
@@ -337,23 +346,18 @@ pub mod transaction_response {
         #[prost(message, repeated, tag="3")]
         pub docs_json: ::prost::alloc::vec::Vec<super::super::flow::Slice>,
     }
-    /// Mark the end of the Store phase, indicating that all documents have been
-    /// fully stored.
-    ///
-    /// If the remote store is authoritative, tell the Flow runtime that it has
-    /// committed.
-    ///
-    /// If the recovery log is authoritative, DriverCommitted is sent but no actual
-    /// transactional driver commit is performed.
+    /// StartedCommit responds to a TransactionRequest.StartCommit of the client.
+    /// The driver has processed all Store requests, it has started to commit its
+    /// transaction (if it has one), and it is now ready for the runtime to start
+    /// committing to its own recovery log.
     #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct DriverCommitted {
+    pub struct StartedCommit {
+        #[prost(message, optional, tag="1")]
+        pub driver_checkpoint: ::core::option::Option<super::super::flow::DriverCheckpoint>,
     }
-    /// Notify the Flow runtime of receipt of it's confirmation that the
-    /// Flow recovery log has committed.
-    ///
-    /// If the driver utilizes staged data which is idempotently applied,
-    /// it must apply staged data of the commit at this time, and respond
-    /// with Acknowledged only once that's completed.
+    /// Acknowledged responds to a TransactionRequest.Acknowledge of the client.
+    /// The driver has fully committed its transaction (if it has one),
+    /// and is ready to begin the next.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Acknowledged {
     }

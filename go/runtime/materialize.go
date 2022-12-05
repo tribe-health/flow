@@ -200,23 +200,13 @@ func (m *Materialize) StartCommit(shard consumer.Shard, cp pf.Checkpoint, waitFo
 		"checkpoint", cp,
 	)
 
-	if driverCP, err := m.client.Prepare(cp); err != nil {
-		return client.FinishedOperation(err)
-	} else if err = updateDriverCheckpoint(m.store, driverCP); err != nil {
+	// TODO(johnny): Move to FinalizeTxn.
+	var deprecatedDriverCP, err = m.client.Flush(cp) // `cp` is deprecated here.
+	if err != nil {
 		return client.FinishedOperation(err)
 	}
-
-	var commitOps = pm.CommitOps{
-		DriverCommitted: client.NewAsyncOperation(),
-		LogCommitted:    nil,
-		Acknowledged:    client.NewAsyncOperation(),
-	}
-
-	// Arrange for our store to commit to its recovery log upon DriverCommitted.
-	commitOps.LogCommitted = m.store.StartCommit(shard, cp,
-		consumer.OpFutures{commitOps.DriverCommitted: struct{}{}})
-
-	stats, err := m.client.StartCommit(commitOps)
+	// TODO(johnny): Move to FinalizeTxn.
+	stats, err := m.client.Store()
 	if err != nil {
 		return client.FinishedOperation(err)
 	}
@@ -230,16 +220,30 @@ func (m *Materialize) StartCommit(shard consumer.Shard, cp pf.Checkpoint, waitFo
 		return client.FinishedOperation(fmt.Errorf("publishing stats: %w", err))
 	}
 
-	// Wait for any |waitFor| operations. This may include a stats publish of a prior transaction.
-	for op := range waitFor {
-		if op.Err() != nil {
-			return client.FinishedOperation(fmt.Errorf("dependency failed: %w", op.Err()))
-		}
+	driverCP, err := m.client.StartCommit(cp)
+	if err != nil {
+		return client.FinishedOperation(err)
 	}
 
-	// Return Acknowledged as the StartCommit future, which requires that it
-	// resolve before the next transaction may begin to close.
-	return commitOps.Acknowledged
+	// Persist driver checkpoint into our recovery log.
+	if len(driverCP.DriverCheckpointJson) == 0 {
+		driverCP = deprecatedDriverCP
+	}
+	if err = updateDriverCheckpoint(m.store, driverCP); err != nil {
+		return client.FinishedOperation(err)
+	}
+
+	// Start a commit to the recovery log.
+	var logCommitted = m.store.StartCommit(shard, cp, waitFor)
+
+	// Write Acknowledge upon logCommited resolving.
+	// We gate sending Load until we read a corresponding Acknowledged,
+	// but do immediately begin consuming these documents for the next transaction,
+	// and then send all flighted-thus-far keys upon receiving Acknowledged,
+	// and thereafter sending streaming Load requests until FinalizeTxn.
+	m.client.Acknowledge(logCommitted)
+
+	return logCommitted
 }
 
 func (m *Materialize) materializationStats(statsPerBinding []*pf.CombineAPI_Stats) StatsEvent {

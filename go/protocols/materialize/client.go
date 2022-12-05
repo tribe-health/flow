@@ -58,11 +58,6 @@ type TxnClient struct {
 // CommitOps are operations which coordinate the mutual commit of a
 // transaction between the Flow runtime and materialization driver.
 type CommitOps struct {
-	// DriverCommitted resolves on reading DriverCommitted of the prior transaction.
-	// This operation is a depencency of a staged recovery log write, and its
-	// resolution allows the recovery log commit to proceed.
-	// Nil if there isn't an ongoing driver commit.
-	DriverCommitted *client.AsyncOperation
 	// LogCommitted resolves on the prior transactions's commit to the recovery log.
 	// When resolved, the TxnClient notifies the driver by sending Acknowledge.
 	// Nil if there isn't an ongoing recovery log commit.
@@ -76,16 +71,15 @@ type CommitOps struct {
 type txnClientState int
 
 const (
-	// We've sent Commit, and may send Load.
-	txLoadCommit txnClientState = iota
-	// We've sent Acknowledge, and may send Load.
-	txLoadAcknowledge txnClientState = iota
-	// We've sent Prepare, and must Commit next.
-	txPrepare txnClientState = iota
-	// We've received Prepared, and are about to commit.
-	rxPrepared txnClientState = iota
-	// We've received CommitOps, and await DriverCommitted.
-	rxPendingCommit txnClientState = iota
+	// We've sent Acknowledge, and are awaiting Acknowledged.
+	txAcknowledge txnClientState = iota
+	txLoad        txnClientState = iota
+	// We've sent Flush and are awaiting Flushed.
+	txFlush txnClientState = iota
+	// We've received Flushed, and are about to commit.
+	rxFlushed txnClientState = iota
+	// We've received CommitOps and sent StartCommit, and await StartedCommit.
+	txStartCommit txnClientState = iota
 	// We've received DriverCommitted, and await Acknowledged & Loaded.
 	rxDriverCommitted txnClientState = iota
 	// We've received Acknowledged, and await Loaded & Prepared.
@@ -279,53 +273,40 @@ func (f *TxnClient) combineRight(binding int, packedKey []byte, doc json.RawMess
 	return load, nil
 }
 
-// Prepare to commit with the given Checkpoint.
-// Block until the driver's Prepared response is read, with an optional driver
-// checkpoint to commit in the Flow recovery log.
-func (f *TxnClient) Prepare(flowCheckpoint pf.Checkpoint) (pf.DriverCheckpoint, error) {
+func (f *TxnClient) Flush(deprecatedFlowCP pf.Checkpoint) (
+	deprecatedDriverCP pf.DriverCheckpoint,
+	_ error,
+) {
 	f.tx.Lock()
 	defer f.tx.Unlock()
 
-	if f.tx.state != txLoadAcknowledge {
-		panic(fmt.Sprintf("client protocol error: SendPrepare is invalid in state %v", f.tx.state))
+	if f.tx.state != txLoad {
+		panic(fmt.Sprintf("client protocol error: FlushThenStore is invalid in state %v", f.tx.state))
 	}
 
-	if err := WritePrepare(f.tx.client, &f.tx.staged, flowCheckpoint); err != nil {
+	if err := WriteFlush(f.tx.client, &f.tx.staged, deprecatedFlowCP); err != nil {
 		return pf.DriverCheckpoint{}, err
 	}
-	f.tx.state = txPrepare
+	f.tx.state = txFlush
 
 	// We deliberately hold the |f.tx| lock while awaiting Prepared,
 	// because the Prepare => Prepared interaction is synchronous.
 
 	select {
-	case prepared := <-f.tx.preparedCh:
-		return prepared, nil
+	case deprecatedDriverCP = <-f.tx.flushedCh:
 	case <-f.rx.loopOp.Done():
 		return pf.DriverCheckpoint{}, f.rx.loopOp.Err()
 	}
+
+	// Now store.
 }
 
-// StartCommit of the prepared transaction. The CommitOps must be initialized by the caller.
-// The caller must arrange for LogCommitted to be resolved appropriately, after DriverCommitted.
-// The *TxnClient will resolve DriverCommitted & Acknowledged.
-func (f *TxnClient) StartCommit(ops CommitOps) (_ []*pf.CombineAPI_Stats, __out error) {
-	// If |ops| futures are non-nil on return, we failed to send them to readLoop
-	// and must resolve them now.
-	defer func() {
-		if ops.DriverCommitted != nil {
-			ops.DriverCommitted.Resolve(__out)
-		}
-		if ops.Acknowledged != nil {
-			ops.Acknowledged.Resolve(__out)
-		}
-	}()
-
+func (f *TxnClient) Store() (_ []*pf.CombineAPI_Stats, _ error) {
 	f.tx.Lock()
 	defer f.tx.Unlock()
 
-	if f.tx.state != txPrepare {
-		panic(fmt.Sprintf("client protocol error: StartCommit is invalid in state %v", f.tx.state))
+	if f.tx.state != txLoad {
+		panic(fmt.Sprintf("client protocol error: FlushThenStore is invalid in state %v", f.tx.state))
 	}
 
 	f.shared.Lock()
@@ -363,6 +344,33 @@ func (f *TxnClient) StartCommit(ops CommitOps) (_ []*pf.CombineAPI_Stats, __out 
 			allStats = append(allStats, stats)
 		}
 	}
+}
+
+// StartCommit of the prepared transaction. The CommitOps must be initialized by the caller.
+// The caller must arrange for LogCommitted to be resolved appropriately, after DriverCommitted.
+// The *TxnClient will resolve DriverCommitted & Acknowledged.
+func (f *TxnClient) StartCommit(flowCP pf.Checkpoint) (driverCP pf.DriverCheckpoint, __out error) {
+	// If |ops| futures are non-nil on return, we failed to send them to readLoop
+	// and must resolve them now.
+	defer func() {
+		if ops.Acknowledged != nil {
+			ops.Acknowledged.Resolve(__out)
+		}
+	}()
+
+	f.tx.Lock()
+	defer f.tx.Unlock()
+
+	if f.tx.state != txPrepare {
+		panic(fmt.Sprintf("client protocol error: StartCommit is invalid in state %v", f.tx.state))
+	}
+
+	f.shared.Lock()
+	defer f.shared.Unlock()
+
+	// We hold both the |f.tx| and |f.shared| locks during the store phase.
+	// The read loop accesses |f.shared| to handled Loaded responses,
+	// but those are disallowed at this stage of the protocol.
 
 	// Inform read loop of new CommitOps.
 	select {
@@ -373,7 +381,7 @@ func (f *TxnClient) StartCommit(ops CommitOps) (_ []*pf.CombineAPI_Stats, __out 
 	}
 
 	// Tell the driver to commit.
-	if err := WriteCommit(f.tx.client, &f.tx.staged); err != nil {
+	if err := WriteStartCommit(f.tx.client, &f.tx.staged); err != nil {
 		return nil, err
 	}
 
