@@ -43,8 +43,8 @@ type Driver struct {
 	NewEndpoint func(context.Context, json.RawMessage) (Endpoint, error)
 	// NewResource returns an uninitialized Resource which may be parsed into.
 	NewResource func(ep Endpoint) Resource
-	// NewTransactor returns a Transactor ready for pm.RunTransactions.
-	NewTransactor func(context.Context, Endpoint, *pf.MaterializationSpec, Fence, []Resource) (pm.Transactor, error)
+	// RunTransactions runs a transactions over an opened TransactionsServer RPC stream.
+	RunTransactions func(pm.Driver_TransactionsServer, Endpoint, *pf.MaterializationSpec, Fence, []Resource) error
 }
 
 var _ pm.DriverServer = &Driver{}
@@ -331,18 +331,18 @@ func (d *Driver) Transactions(stream pm.Driver_TransactionsServer) error {
 		}
 	}
 
-	transactor, err := d.NewTransactor(
-		stream.Context(), endpoint, open.Open.Materialization, fence, resources)
-	if err != nil {
-		return err
-	}
-
 	if err = stream.Send(&pm.TransactionResponse{
-		Opened: &pm.TransactionResponse_Opened{FlowCheckpoint: fence.Checkpoint()}}); err != nil {
+		Opened: &pm.TransactionResponse_Opened{RuntimeCheckpoint: fence.Checkpoint()}}); err != nil {
 		return fmt.Errorf("sending Opened: %w", err)
 	}
 
-	return pm.RunTransactions(stream, transactor, fence.LogEntry())
+	return d.RunTransactions(
+		stream,
+		endpoint,
+		open.Open.Materialization,
+		fence,
+		resources,
+	)
 }
 
 // loadConstraints retrieves an existing binding spec under the given

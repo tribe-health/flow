@@ -102,71 +102,212 @@ func NewSQLiteDriver() *sqlDriver.Driver {
 			return sqlDriver.NewStdEndpoint(parsed, db, sqlDriver.SQLiteSQLGenerator(), sqlDriver.DefaultFlowTables("")), nil
 
 		},
-		NewTransactor: func(
-			ctx context.Context,
-			epi sqlDriver.Endpoint,
-			spec *pf.MaterializationSpec,
-			fence sqlDriver.Fence,
-			resources []sqlDriver.Resource,
-		) (_ pm.Transactor, err error) {
-			var ep = epi.(*sqlDriver.StdEndpoint)
-			var d = &transactor{
-				gen: ep.Generator(),
-			}
-			d.store.fence = fence.(*sqlDriver.StdFence)
+		RunTransactions: RunTransactions,
+	}
+}
 
-			// Establish connections.
-			if d.load.conn, err = ep.DB().Conn(ctx); err != nil {
-				return nil, fmt.Errorf("load DB.Conn: %w", err)
-			}
-			if d.store.conn, err = ep.DB().Conn(ctx); err != nil {
-				return nil, fmt.Errorf("store DB.Conn: %w", err)
+func RunTransactions(
+	stream pm.Driver_TransactionsServer,
+	endpoint sqlDriver.Endpoint,
+	spec *pf.MaterializationSpec,
+	fence sqlDriver.Fence,
+	resources []sqlDriver.Resource,
+) error {
+	var t, err = newTransactor(stream.Context(), endpoint, spec, fence, resources)
+	if err != nil {
+		return err
+	}
+	defer t.Destroy()
+
+	// TODO(johnny): this is hacky; Driver should pass these through?
+	var request = pm.TransactionRequest{Open: &pm.TransactionRequest_Open{}}
+	var response = pm.TransactionResponse{Opened: &pm.TransactionResponse_Opened{}}
+
+	for {
+		if err = pm.WriteAcknowledged(stream, &response); err != nil {
+			return err
+		} else if err = pm.ReadAcknowledge(stream, &request); err != nil {
+			return err
+		}
+
+		// Stage all keys to load.
+		for {
+			var load, ok, err = pm.ReadLoad(stream, &request)
+			if err != nil {
+				return err
+			} else if !ok {
+				break
 			}
 
-			// Attach temporary DB used for staging keys to load.
-			if _, err = d.load.conn.ExecContext(ctx, attachSQL); err != nil {
-				return nil, fmt.Errorf("Exec(%s): %w", attachSQL, err)
+			var b = t.bindings[load.Binding]
+
+			if converted, err := b.load.params.Convert(load.Key); err != nil {
+				return fmt.Errorf("converting Load key: %w", err)
+			} else if _, err = b.load.insert.stmt.Exec(converted...); err != nil {
+				return fmt.Errorf("inserting Load key: %w", err)
+			}
+		}
+
+		if err = pm.ReadFlush(&request); err != nil {
+			return err
+		}
+
+		// Issue a union join of the target tables and their (now staged) load keys,
+		// and send back results.
+		rows, err := t.loadStmt.Query()
+		if err != nil {
+			return fmt.Errorf("querying Load documents: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var binding int
+			var document sql.RawBytes
+
+			if err = rows.Scan(&binding, &document); err != nil {
+				return fmt.Errorf("scanning Load document: %w", err)
+			} else if err = pm.WriteLoaded(stream, &response, binding, json.RawMessage(document)); err != nil {
+				return err
+			}
+		}
+		if err = rows.Err(); err != nil {
+			return fmt.Errorf("querying Loads: %w", err)
+		}
+
+		// Remove rows from our load table.
+		for _, b := range t.bindings {
+			if _, err := b.load.truncate.stmt.Exec(); err != nil {
+				return fmt.Errorf("truncating Loads: %w", err)
+			}
+		}
+
+		if err = pm.WriteFlushed(stream, &response); err != nil {
+			return err
+		}
+
+		txn, err := t.conn.BeginTx(stream.Context(), nil)
+		if err != nil {
+			return fmt.Errorf("conn.BeginTx: %w", err)
+		}
+
+		var insertStmts = make([]*sql.Stmt, len(t.bindings))
+		var updateStmts = make([]*sql.Stmt, len(t.bindings))
+
+		for i, b := range t.bindings {
+			insertStmts[i] = txn.Stmt(b.store.insert.stmt)
+			updateStmts[i] = txn.Stmt(b.store.update.stmt)
+		}
+
+		for {
+			var store, ok, err = pm.ReadStore(stream, &request)
+			if err != nil {
+				return err
+			} else if !ok {
+				break
 			}
 
-			for _, spec := range spec.Bindings {
-				var target = sqlDriver.ResourcePath(spec.ResourcePath).Join()
-				if err = d.addBinding(ctx, target, spec); err != nil {
-					return nil, fmt.Errorf("%s: %w", target, err)
+			var b = t.bindings[store.Binding]
+
+			if store.Exists {
+				converted, err := b.store.update.params.Convert(
+					append(append(store.Values, store.RawJSON), store.Key...))
+				if err != nil {
+					return fmt.Errorf("converting update parameters: %w", err)
+				}
+				if _, err = updateStmts[store.Binding].Exec(converted...); err != nil {
+					return fmt.Errorf("updating document: %w", err)
+				}
+			} else {
+				converted, err := b.store.insert.params.Convert(
+					append(append(store.Key, store.Values...), store.RawJSON))
+				if err != nil {
+					return fmt.Errorf("converting insert parameters: %w", err)
+				}
+				if _, err = insertStmts[store.Binding].Exec(converted...); err != nil {
+					return fmt.Errorf("inserting document: %w", err)
 				}
 			}
+		}
 
-			// Build a query which unions the results of each load subquery.
-			var subqueries []string
-			for _, b := range d.bindings {
-				subqueries = append(subqueries, b.load.query.sql)
-			}
-			var loadAllSQL = strings.Join(subqueries, "\nUNION ALL\n") + ";"
+		runtimeCP, err := pm.ReadStartCommit(&request)
+		if err != nil {
+			return err
+		}
+		t.fence.SetCheckpoint(runtimeCP)
 
-			d.load.stmt, err = d.load.conn.PrepareContext(ctx, loadAllSQL)
-			if err != nil {
-				return nil, fmt.Errorf("conn.PrepareContext(%s): %w", loadAllSQL, err)
-			}
+		if err = pm.WriteStartedCommit(stream, &response, pf.DriverCheckpoint{}); err != nil {
+			return err
+		}
 
-			return d, nil
-		},
+		if err = t.fence.Update(stream.Context(),
+			func(ctx context.Context, sql string, arguments ...interface{}) (rowsAffected int64, _ error) {
+				if result, err := txn.ExecContext(ctx, sql, arguments...); err != nil {
+					return 0, fmt.Errorf("txn.Exec: %w", err)
+				} else if rowsAffected, err = result.RowsAffected(); err != nil {
+					return 0, fmt.Errorf("result.RowsAffected: %w", err)
+				}
+				return
+			},
+		); err != nil {
+			return fmt.Errorf("fence.Update: %w", err)
+		}
+
+		if err := txn.Commit(); err != nil {
+			return fmt.Errorf("store.txn.Commit: %w", err)
+		}
 	}
 }
 
 type transactor struct {
-	gen *sqlDriver.Generator
-
-	// Variables exclusively used by Load.
-	load struct {
-		conn *sql.Conn
-		stmt *sql.Stmt
-	}
-	// Variables accessed by Prepare, Store, and Commit.
-	store struct {
-		conn  *sql.Conn
-		fence *sqlDriver.StdFence
-		txn   *sql.Tx
-	}
+	gen      *sqlDriver.Generator
+	conn     *sql.Conn
+	loadStmt *sql.Stmt
+	fence    *sqlDriver.StdFence
 	bindings []*binding
+}
+
+func newTransactor(
+	ctx context.Context,
+	epi sqlDriver.Endpoint,
+	spec *pf.MaterializationSpec,
+	fence sqlDriver.Fence,
+	resources []sqlDriver.Resource,
+) (_ *transactor, err error) {
+	var ep = epi.(*sqlDriver.StdEndpoint)
+	var d = &transactor{
+		gen: ep.Generator(),
+	}
+	d.fence = fence.(*sqlDriver.StdFence)
+
+	// Establish connections.
+	if d.conn, err = ep.DB().Conn(ctx); err != nil {
+		return nil, fmt.Errorf("DB.Conn: %w", err)
+	}
+	// Attach temporary DB used for staging keys to load.
+	if _, err = d.conn.ExecContext(ctx, attachSQL); err != nil {
+		return nil, fmt.Errorf("Exec(%s): %w", attachSQL, err)
+	}
+
+	for _, spec := range spec.Bindings {
+		var target = sqlDriver.ResourcePath(spec.ResourcePath).Join()
+		if err = d.addBinding(ctx, target, spec); err != nil {
+			return nil, fmt.Errorf("%s: %w", target, err)
+		}
+	}
+
+	// Build a query which unions the results of each load subquery.
+	var subqueries []string
+	for _, b := range d.bindings {
+		subqueries = append(subqueries, b.load.query.sql)
+	}
+	var loadAllSQL = strings.Join(subqueries, "\nUNION ALL\n") + ";"
+
+	d.loadStmt, err = d.conn.PrepareContext(ctx, loadAllSQL)
+	if err != nil {
+		return nil, fmt.Errorf("conn.PrepareContext(%s): %w", loadAllSQL, err)
+	}
+
+	return d, nil
 }
 
 type binding struct {
@@ -231,7 +372,7 @@ func (t *transactor) addBinding(ctx context.Context, targetName string, spec *pf
 	}
 
 	// Create a binding-scoped temporary table for staged keys to load.
-	if _, err = t.load.conn.ExecContext(ctx, keyCreateSQL); err != nil {
+	if _, err = t.conn.ExecContext(ctx, keyCreateSQL); err != nil {
 		return fmt.Errorf("Exec(%s): %w", keyCreateSQL, err)
 	}
 	// Prepare query statements.
@@ -240,11 +381,11 @@ func (t *transactor) addBinding(ctx context.Context, targetName string, spec *pf
 		sql  string
 		stmt **sql.Stmt
 	}{
-		{t.load.conn, b.load.insert.sql, &b.load.insert.stmt},
-		{t.load.conn, b.load.query.sql, &b.load.query.stmt},
-		{t.load.conn, b.load.truncate.sql, &b.load.truncate.stmt},
-		{t.store.conn, b.store.insert.sql, &b.store.insert.stmt},
-		{t.store.conn, b.store.update.sql, &b.store.update.stmt},
+		{t.conn, b.load.insert.sql, &b.load.insert.stmt},
+		{t.conn, b.load.query.sql, &b.load.query.stmt},
+		{t.conn, b.load.truncate.sql, &b.load.truncate.stmt},
+		{t.conn, b.store.insert.sql, &b.store.insert.stmt},
+		{t.conn, b.store.update.sql, &b.store.update.stmt},
 	} {
 		*s.stmt, err = s.conn.PrepareContext(ctx, s.sql)
 		if err != nil {
@@ -256,147 +397,9 @@ func (t *transactor) addBinding(ctx context.Context, targetName string, spec *pf
 	return nil
 }
 
-func (d *transactor) Load(
-	it *pm.LoadIterator,
-	// We ignore priorCommitCh and priorAcknowledgedCh because we stage the
-	// contents of the iterator, evaluating loads after it's fully drained.
-	_, _ <-chan struct{},
-	loaded func(int, json.RawMessage) error,
-) error {
-	// Remove rows left over from the last transaction.
-	for _, b := range d.bindings {
-		if _, err := b.load.truncate.stmt.Exec(); err != nil {
-			return fmt.Errorf("truncating Loads: %w", err)
-		}
-	}
-
-	for it.Next() {
-		var b = d.bindings[it.Binding]
-
-		if converted, err := b.load.params.Convert(it.Key); err != nil {
-			return fmt.Errorf("converting Load key: %w", err)
-		} else if _, err = b.load.insert.stmt.Exec(converted...); err != nil {
-			return fmt.Errorf("inserting Load key: %w", err)
-		}
-	}
-	if it.Err() != nil {
-		return it.Err()
-	}
-
-	// Issue a union join of the target tables and their (now staged) load keys,
-	// and send results to the |loaded| callback.
-	rows, err := d.load.stmt.Query()
-	if err != nil {
-		return fmt.Errorf("querying Load documents: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var binding int
-		var document sql.RawBytes
-
-		if err = rows.Scan(&binding, &document); err != nil {
-			return fmt.Errorf("scanning Load document: %w", err)
-		} else if err = loaded(binding, json.RawMessage(document)); err != nil {
-			return err
-		}
-	}
-	if err = rows.Err(); err != nil {
-		return fmt.Errorf("querying Loads: %w", err)
-	}
-
-	return nil
-}
-
-func (d *transactor) Prepare(ctx context.Context, prepare pm.TransactionRequest_Prepare) (pf.DriverCheckpoint, error) {
-	d.store.fence.SetCheckpoint(prepare.FlowCheckpoint)
-	return pf.DriverCheckpoint{}, nil
-}
-
-func (d *transactor) Store(it *pm.StoreIterator) error {
-	var err error
-
-	if d.store.txn, err = d.store.conn.BeginTx(it.Context(), nil); err != nil {
-		return fmt.Errorf("conn.BeginTx: %w", err)
-	}
-
-	var insertStmts = make([]*sql.Stmt, len(d.bindings))
-	var updateStmts = make([]*sql.Stmt, len(d.bindings))
-
-	for i, b := range d.bindings {
-		insertStmts[i] = d.store.txn.Stmt(b.store.insert.stmt)
-		updateStmts[i] = d.store.txn.Stmt(b.store.update.stmt)
-	}
-
-	for it.Next() {
-		var b = d.bindings[it.Binding]
-
-		if it.Exists {
-			converted, err := b.store.update.params.Convert(
-				append(append(it.Values, it.RawJSON), it.Key...))
-			if err != nil {
-				return fmt.Errorf("converting update parameters: %w", err)
-			}
-			if _, err = updateStmts[it.Binding].Exec(converted...); err != nil {
-				return fmt.Errorf("updating document: %w", err)
-			}
-		} else {
-			converted, err := b.store.insert.params.Convert(
-				append(append(it.Key, it.Values...), it.RawJSON))
-			if err != nil {
-				return fmt.Errorf("converting insert parameters: %w", err)
-			}
-			if _, err = insertStmts[it.Binding].Exec(converted...); err != nil {
-				return fmt.Errorf("inserting document: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
-func (d *transactor) Commit(ctx context.Context) error {
-	var err error
-
-	if d.store.txn == nil {
-		// If Store was skipped, we won't have begun a DB transaction yet.
-		if d.store.txn, err = d.store.conn.BeginTx(ctx, nil); err != nil {
-			return fmt.Errorf("conn.BeginTx: %w", err)
-		}
-	}
-
-	if err = d.store.fence.Update(ctx,
-		func(ctx context.Context, sql string, arguments ...interface{}) (rowsAffected int64, _ error) {
-			if result, err := d.store.txn.ExecContext(ctx, sql, arguments...); err != nil {
-				return 0, fmt.Errorf("txn.Exec: %w", err)
-			} else if rowsAffected, err = result.RowsAffected(); err != nil {
-				return 0, fmt.Errorf("result.RowsAffected: %w", err)
-			}
-			return
-		},
-	); err != nil {
-		return fmt.Errorf("fence.Update: %w", err)
-	}
-
-	if err := d.store.txn.Commit(); err != nil {
-		return fmt.Errorf("store.txn.Commit: %w", err)
-	}
-	d.store.txn = nil
-
-	return nil
-}
-
-// Acknowledge is a no-op since the SQLite database is authoritative.
-func (d *transactor) Acknowledge(context.Context) error { return nil }
-
 func (d *transactor) Destroy() {
-	if d.store.txn != nil {
-		d.store.txn.Rollback()
-	}
-	if err := d.load.conn.Close(); err != nil {
+	if err := d.conn.Close(); err != nil {
 		log.WithField("err", err).Error("failed to close load connection")
-	}
-	if err := d.store.conn.Close(); err != nil {
-		log.WithField("err", err).Error("failed to close store connection")
 	}
 }
 

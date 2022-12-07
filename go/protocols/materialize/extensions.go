@@ -229,8 +229,8 @@ func (m *TransactionRequest_Store) Validate() error {
 
 // Validate returns an error if the message is malformed.
 func (m *TransactionRequest_StartCommit) Validate() error {
-	if len(m.FlowCheckpoint) == 0 {
-		return pb.NewValidationError("expected FlowCheckpoint")
+	if len(m.RuntimeCheckpoint) == 0 {
+		return pb.NewValidationError("expected RuntimeCheckpoint")
 	}
 	return nil
 }

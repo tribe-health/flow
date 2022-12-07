@@ -173,10 +173,10 @@ func (m *Materialize) RestoreCheckpoint(shard consumer.Shard) (cp pf.Checkpoint,
 	}
 
 	// If the store provided a Flow checkpoint, prefer that over
-	// the |checkpoint| recovered from the local recovery log store.
-	if b := m.client.Opened().FlowCheckpoint; len(b) != 0 {
+	// the `checkpoint` recovered from the local recovery log store.
+	if b := m.client.Opened().RuntimeCheckpoint; len(b) != 0 {
 		if err = cp.Unmarshal(b); err != nil {
-			return pf.Checkpoint{}, fmt.Errorf("unmarshal Opened.FlowCheckpoint: %w", err)
+			return pf.Checkpoint{}, fmt.Errorf("unmarshal Opened.RuntimeCheckpoint: %w", err)
 		}
 		checkpointSource = "driver"
 	} else {
@@ -201,16 +201,16 @@ func (m *Materialize) StartCommit(shard consumer.Shard, cp pf.Checkpoint, waitFo
 	)
 
 	// TODO(johnny): Move to FinalizeTxn.
-	var deprecatedDriverCP, err = m.client.Flush(cp) // `cp` is deprecated here.
-	if err != nil {
+	if err := m.client.Flush(cp); err != nil { // `cp` is deprecated here.
 		return client.FinishedOperation(err)
 	}
 	// TODO(johnny): Move to FinalizeTxn.
-	stats, err := m.client.Store()
+	var stats, err = m.client.Store()
 	if err != nil {
 		return client.FinishedOperation(err)
 	}
 
+	// TODO(johnny): Move to FinalizeTxn, and write as a regular (non-deferred) message.
 	// Now that we've drained the combiner, we're able to finish publishing the stats for this
 	// transaction. This PendingPublish was initialized by the call to DeferPublishUncommitted
 	// in FinalizeTxn.
@@ -220,30 +220,25 @@ func (m *Materialize) StartCommit(shard consumer.Shard, cp pf.Checkpoint, waitFo
 		return client.FinishedOperation(fmt.Errorf("publishing stats: %w", err))
 	}
 
-	driverCP, err := m.client.StartCommit(cp)
+	driverCP, opAcknowledged, err := m.client.StartCommit(cp)
 	if err != nil {
 		return client.FinishedOperation(err)
-	}
-
-	// Persist driver checkpoint into our recovery log.
-	if len(driverCP.DriverCheckpointJson) == 0 {
-		driverCP = deprecatedDriverCP
-	}
-	if err = updateDriverCheckpoint(m.store, driverCP); err != nil {
+	} else if err = updateDriverCheckpoint(m.store, driverCP); err != nil {
 		return client.FinishedOperation(err)
 	}
 
-	// Start a commit to the recovery log.
-	var logCommitted = m.store.StartCommit(shard, cp, waitFor)
+	// Synchronously commit to the recovery log.
+	// This should be fast (milliseconds) because we're not writing much data.
+	// Then, write Acknowledge to the client.
+	if opLog := m.store.StartCommit(shard, cp, waitFor); opLog.Err() != nil {
+		return opLog
+	} else if err = m.client.Acknowledge(); err != nil {
+		return client.FinishedOperation(err)
+	}
 
-	// Write Acknowledge upon logCommited resolving.
-	// We gate sending Load until we read a corresponding Acknowledged,
-	// but do immediately begin consuming these documents for the next transaction,
-	// and then send all flighted-thus-far keys upon receiving Acknowledged,
-	// and thereafter sending streaming Load requests until FinalizeTxn.
-	m.client.Acknowledge(logCommitted)
-
-	return logCommitted
+	// Return `opAcknowledged` so that the next transaction will remain open
+	// so long as the driver is still committing the current transaction.
+	return opAcknowledged
 }
 
 func (m *Materialize) materializationStats(statsPerBinding []*pf.CombineAPI_Stats) StatsEvent {

@@ -248,15 +248,15 @@ pub mod transaction_request {
         pub packed_keys: ::prost::alloc::vec::Vec<super::super::flow::Slice>,
     }
     /// Flush loads. No further Loads will be sent in this transaction,
-    /// and the client will await the driver's remaining Loaded responses
+    /// and the runtime will await the driver's remaining Loaded responses
     /// followed by one Flushed response.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Flush {
         /// Flow checkpoint to commit with this transaction.
         /// This is being removed, in favor of instead sending
-        /// StartCommit.flow_checkpoint
+        /// StartCommit.runtime_checkpoint
         #[prost(bytes="vec", tag="1")]
-        pub deprecated_flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
+        pub deprecated_runtime_checkpoint: ::prost::alloc::vec::Vec<u8>,
     }
     /// Store documents of this transaction commit.
     #[derive(Clone, PartialEq, ::prost::Message)]
@@ -284,9 +284,9 @@ pub mod transaction_request {
     /// its transaction (if it has one).
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct StartCommit {
-        /// Flow checkpoint to commit with this transaction.
+        /// Flow runtime checkpoint to commit with this transaction.
         #[prost(bytes="vec", tag="1")]
-        pub flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
+        pub runtime_checkpoint: ::prost::alloc::vec::Vec<u8>,
     }
     /// Notify the driver that the previous transaction has committed to the Flow
     /// runtime's recovery log.
@@ -319,7 +319,7 @@ pub mod transaction_response {
     /// Opened responds to TransactionRequest.Open of the client.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Opened {
-        /// Flow checkpoint to begin processing from.
+        /// Flow runtime checkpoint to begin processing from.
         /// If empty, the most recent checkpoint of the Flow recovery log is used.
         ///
         /// Or, a driver may send the value []byte{0xf8, 0xff, 0xff, 0xff, 0xf, 0x1}
@@ -327,7 +327,7 @@ pub mod transaction_response {
         /// rebuilding the materialization from scratch. This sentinel is a trivial
         /// encoding of the max-value 2^29-1 protobuf tag with boolean true.
         #[prost(bytes="vec", tag="1")]
-        pub flow_checkpoint: ::prost::alloc::vec::Vec<u8>,
+        pub runtime_checkpoint: ::prost::alloc::vec::Vec<u8>,
     }
     /// Loaded responds to TransactionRequest.Loads of the client.
     /// It returns documents of requested keys which have previously been stored.
@@ -355,9 +355,12 @@ pub mod transaction_response {
         #[prost(message, optional, tag="1")]
         pub driver_checkpoint: ::core::option::Option<super::super::flow::DriverCheckpoint>,
     }
-    /// Acknowledged responds to a TransactionRequest.Acknowledge of the client.
-    /// The driver has fully committed its transaction (if it has one),
-    /// and is ready to begin the next.
+    /// Notify the runtime that the previous driver transaction has committed
+    /// to the endpoint store (where applicable). The runtime may begin to
+    /// finalize a next, pipelined transaction.
+    ///
+    /// Acknowledged is _not_ a direct response to TransactionRequest.Acknowledge,
+    /// and Acknowledge vs Acknowledged may be written in either order.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Acknowledged {
     }

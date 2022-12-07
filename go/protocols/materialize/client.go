@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
+	math "math"
 	"sync"
 
 	"github.com/estuary/flow/go/protocols/fdb/tuple"
@@ -16,79 +16,27 @@ import (
 
 // TxnClient is a client of a driver's Transactions RPC.
 type TxnClient struct {
-	// Opened response returned by the server while opening.
-	opened *TransactionResponse_Opened
-	// rx organizes receive state of the TxnClient.
-	// Fields are exclusively accessed from readLoop, with the exception of
-	// |loopOp| which is inspected for loop status.
-	rx struct {
-		commitOps   CommitOps                       // CommitOps being evaluated.
-		commitOpsCh <-chan CommitOps                // Reads from StartCommit().
-		loopOp      *client.AsyncOperation          // Read loop exit status.
-		preparedCh  chan<- pf.DriverCheckpoint      // Sends into Prepare().
-		respCh      <-chan TransactionResponseError // Receive from the driver.
-		state       txnClientState                  // Receive state (one of rx*).
-	}
-	// shared state mutated by both transmission and receive.
-	shared struct {
-		// Combiners of the materialization, one for each binding.
-		combiners []pf.Combiner
-		// Flighted keys of the current transaction for each binding, plus a bounded number of
-		// retained fully-reduced documents of the last transaction.
-		flighted   []map[string]json.RawMessage
-		sync.Mutex // Guards shared state.
-	}
-	// tx organizes transmission state of the TxnClient.
-	// Fields are guarded by the common mutex, and are accessed and mutated
-	// via synchronous public methods of the TxnClient interface.
-	tx struct {
-		client      Driver_TransactionsClient  // Used to send (never receive).
-		commitOpsCh chan<- CommitOps           // Sends from StartCommit().
-		preparedCh  <-chan pf.DriverCheckpoint // Reads into Prepare()
-		staged      *TransactionRequest        // Staged request to be sent to |client|.
-		state       txnClientState             // Transmission state (one of tx*).
-		sync.Mutex                             // Guards all transmission state.
-	}
-	// Specification of this Transactions client.
-	spec *pf.MaterializationSpec
-	// Version of the client's MaterializationSpec.
-	version string
+	client Driver_TransactionsClient
+	// Combiners of the materialization, one for each binding.
+	combiners []pf.Combiner
+	// Guards combiners, which are accessed concurrently from readAcknowledgedAndLoaded().
+	combinersMu sync.Mutex
+	// Flighted keys of the current transaction for each binding, plus a bounded cache of
+	// fully-reduced documents of the last transaction.
+	flighted []map[string]json.RawMessage
+	// OpFuture that's resolved on completion of a current Loaded phase,
+	// or nil if readAcknowledgedAndLoaded is not currently running.
+	opLoaded   *client.AsyncOperation
+	opened     *TransactionResponse_Opened // Opened response returned by the server while opening.
+	rxResponse TransactionResponse         // Response which is received into.
+	spec       *pf.MaterializationSpec     // Specification of this Transactions client.
+	txRequest  TransactionRequest          // Request which is sent from.
+	version    string                      // Version of the client's MaterializationSpec.
+
+	// Temporary storage for a retained DriverCheckpoint. This will be removed.
+	deprecatedDriverCP pf.DriverCheckpoint
 }
 
-// CommitOps are operations which coordinate the mutual commit of a
-// transaction between the Flow runtime and materialization driver.
-type CommitOps struct {
-	// LogCommitted resolves on the prior transactions's commit to the recovery log.
-	// When resolved, the TxnClient notifies the driver by sending Acknowledge.
-	// Nil if there isn't an ongoing recovery log commit.
-	LogCommitted client.OpFuture
-	// Acknowledged resolves on reading Acknowledged from the driver, and completes
-	// the transaction lifecycle. Once resolved (and not before), a current and
-	// concurrent may begin to commit (by sending Prepared).
-	Acknowledged *client.AsyncOperation
-}
-
-type txnClientState int
-
-const (
-	// We've sent Acknowledge, and are awaiting Acknowledged.
-	txAcknowledge txnClientState = iota
-	txLoad        txnClientState = iota
-	// We've sent Flush and are awaiting Flushed.
-	txFlush txnClientState = iota
-	// We've received Flushed, and are about to commit.
-	rxFlushed txnClientState = iota
-	// We've received CommitOps and sent StartCommit, and await StartedCommit.
-	txStartCommit txnClientState = iota
-	// We've received DriverCommitted, and await Acknowledged & Loaded.
-	rxDriverCommitted txnClientState = iota
-	// We've received Acknowledged, and await Loaded & Prepared.
-	rxAcknowledged txnClientState = iota
-)
-
-// OpenTransactions opens a Transactions RPC.
-// It returns a *TxnClient which provides a high-level API for executing
-// the materialization transaction workflow.
 func OpenTransactions(
 	ctx context.Context,
 	driver DriverClient,
@@ -105,7 +53,6 @@ func OpenTransactions(
 
 	var combiners []pf.Combiner
 	var flighted []map[string]json.RawMessage
-	var txStaged *TransactionRequest
 
 	for _, b := range spec.Bindings {
 		var combiner, err = newCombinerFn(b)
@@ -127,67 +74,48 @@ func OpenTransactions(
 		}
 	}()
 
-	if err = rpc.Send(&TransactionRequest{
-		Open: &TransactionRequest_Open{
+	txRequest, err := WriteOpen(rpc,
+		&TransactionRequest_Open{
 			Materialization:      spec,
 			Version:              version,
 			KeyBegin:             range_.KeyBegin,
 			KeyEnd:               range_.KeyEnd,
 			DriverCheckpointJson: driverCheckpoint,
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("sending Open: %w", err)
-	}
-
-	// Read Opened response with driver's optional Flow Checkpoint.
-	opened, err := rpc.Recv()
+		})
 	if err != nil {
-		return nil, fmt.Errorf("reading Opened: %w", err)
-	} else if opened.Opened == nil {
-		return nil, fmt.Errorf("expected Opened, got %#v", opened.String())
-	}
-
-	// Write Acknowledge request to re-acknowledge the last commit.
-	if err := WriteAcknowledge(rpc, &txStaged); err != nil {
 		return nil, err
 	}
 
-	// Read Acknowledged response.
-	acked, err := rpc.Recv()
+	// Read Opened response with driver's optional Flow Checkpoint.
+	rxResponse, err := ReadOpened(rpc)
 	if err != nil {
-		return nil, fmt.Errorf("reading Acknowledged: %w", err)
-	} else if acked.Acknowledged == nil {
-		return nil, fmt.Errorf("expected Acknowledged, got %#v", acked.String())
+		return nil, err
 	}
 
-	var preparedCh = make(chan pf.DriverCheckpoint)
-	var commitOpsCh = make(chan CommitOps)
-
-	var out = &TxnClient{
-		spec:    spec,
-		version: version,
-		opened:  opened.Opened,
+	// Write Acknowledge request to re-acknowledge the last commit.
+	if err := WriteAcknowledge(rpc, &txRequest); err != nil {
+		return nil, err
 	}
-	out.tx.client = rpc
-	out.tx.commitOpsCh = commitOpsCh
-	out.tx.preparedCh = preparedCh
-	out.tx.staged = txStaged
-	out.tx.state = txLoadAcknowledge
 
-	out.rx.commitOps = CommitOps{}
-	out.rx.commitOpsCh = commitOpsCh
-	out.rx.loopOp = client.NewAsyncOperation()
-	out.rx.preparedCh = preparedCh
-	out.rx.respCh = TransactionResponseChannel(rpc)
-	out.rx.state = rxAcknowledged
+	var c = &TxnClient{
+		combiners: combiners,
+		//combinersMu: sync.Mutex{},
+		flighted:   flighted,
+		opLoaded:   client.NewAsyncOperation(),
+		opened:     rxResponse.Opened,
+		client:     rpc,
+		rxResponse: rxResponse,
+		spec:       spec,
+		txRequest:  txRequest,
+		version:    version,
 
-	out.shared.combiners = combiners
-	out.shared.flighted = flighted
-
-	go out.readLoop()
+		// TODO(johnny): Remove me.
+		deprecatedDriverCP: pf.DriverCheckpoint{},
+	}
+	go c.readAcknowledgedAndLoaded(client.NewAsyncOperation())
 
 	rpc = nil // Don't run deferred CloseSend.
-	return out, nil
+	return c, nil
 }
 
 // Opened returns the driver's prior Opened response.
@@ -195,58 +123,49 @@ func (c *TxnClient) Opened() *TransactionResponse_Opened { return c.opened }
 
 // Close the TxnClient. Close returns an error if the RPC is not in an
 // Acknowledged and idle state, or on any other error.
-func (f *TxnClient) Close() error {
-	f.tx.Lock()
-	defer f.tx.Unlock()
+func (c *TxnClient) Close() error {
+	c.client.CloseSend()
 
-	f.tx.client.CloseSend()
-	<-f.rx.loopOp.Done()
+	var opLoadedErr error
+	if c.opLoaded != nil {
+		opLoadedErr = c.opLoaded.Err()
+	}
 
-	for _, c := range f.shared.combiners {
+	for _, c := range c.combiners {
 		c.Destroy()
 	}
 
 	// EOF is a graceful shutdown.
-	if err := f.rx.loopOp.Err(); err != io.EOF {
+	if err := opLoadedErr; err != io.EOF {
 		return err
 	}
 	return nil
 }
 
 // AddDocument to the current transaction under the given binding and tuple-encoded key.
-func (f *TxnClient) AddDocument(binding int, packedKey []byte, doc json.RawMessage) error {
-	f.tx.Lock()
-	defer f.tx.Unlock()
-
-	switch f.tx.state {
-	case txLoadCommit, txLoadAcknowledge:
-	default:
-		return fmt.Errorf("caller protocol error: AddDocument is invalid in state %v", f.tx.state)
-	}
-
-	// Note that combineRight obtains a lock on |f.shared|, but it's not held
-	// while we StageLoad to the connector (which could block).
+func (c *TxnClient) AddDocument(binding int, packedKey []byte, doc json.RawMessage) error {
+	// Note that combineRight obtains a lock on `c.combinerMu`, but it's not held
+	// while we WriteLoad to the connector (which could block).
 	// This allows for a concurrent handling of a Loaded response.
 
-	if load, err := f.combineRight(binding, packedKey, doc); err != nil {
+	if load, err := c.combineRight(binding, packedKey, doc); err != nil {
 		return err
 	} else if !load {
 		// No-op.
-	} else if err = StageLoad(f.tx.client, &f.tx.staged, binding, packedKey); err != nil {
-		return err
+	} else if err = WriteLoad(c.client, &c.txRequest, binding, packedKey); err != nil {
+		return c.writeErr(err)
 	}
 
-	// f.tx.state is unchanged.
 	return nil
 }
 
-func (f *TxnClient) combineRight(binding int, packedKey []byte, doc json.RawMessage) (bool, error) {
-	f.shared.Lock()
-	defer f.shared.Unlock()
+func (c *TxnClient) combineRight(binding int, packedKey []byte, doc json.RawMessage) (bool, error) {
+	c.combinersMu.Lock()
+	defer c.combinersMu.Unlock()
 
-	var flighted = f.shared.flighted[binding]
-	var combiner = f.shared.combiners[binding]
-	var deltaUpdates = f.spec.Bindings[binding].DeltaUpdates
+	var flighted = c.flighted[binding]
+	var combiner = c.combiners[binding]
+	var deltaUpdates = c.spec.Bindings[binding].DeltaUpdates
 	var load bool
 
 	if doc, ok := flighted[string(packedKey)]; ok && doc == nil {
@@ -273,54 +192,27 @@ func (f *TxnClient) combineRight(binding int, packedKey []byte, doc json.RawMess
 	return load, nil
 }
 
-func (f *TxnClient) Flush(deprecatedFlowCP pf.Checkpoint) (
-	deprecatedDriverCP pf.DriverCheckpoint,
-	_ error,
-) {
-	f.tx.Lock()
-	defer f.tx.Unlock()
-
-	if f.tx.state != txLoad {
-		panic(fmt.Sprintf("client protocol error: FlushThenStore is invalid in state %v", f.tx.state))
+func (c *TxnClient) Flush(deprecatedRuntimeCP pf.Checkpoint) error {
+	if err := WriteFlush(c.client, &c.txRequest, deprecatedRuntimeCP); err != nil {
+		return c.writeErr(err)
+	} else if err = c.opLoaded.Err(); err != nil {
+		return err
 	}
+	c.opLoaded = nil // readAcknowledgedAndLoaded has completed.
 
-	if err := WriteFlush(f.tx.client, &f.tx.staged, deprecatedFlowCP); err != nil {
-		return pf.DriverCheckpoint{}, err
+	var err error
+	if c.deprecatedDriverCP, err = ReadFlushed(&c.rxResponse); err != nil {
+		return err
 	}
-	f.tx.state = txFlush
-
-	// We deliberately hold the |f.tx| lock while awaiting Prepared,
-	// because the Prepare => Prepared interaction is synchronous.
-
-	select {
-	case deprecatedDriverCP = <-f.tx.flushedCh:
-	case <-f.rx.loopOp.Done():
-		return pf.DriverCheckpoint{}, f.rx.loopOp.Err()
-	}
-
-	// Now store.
+	return nil
 }
 
-func (f *TxnClient) Store() (_ []*pf.CombineAPI_Stats, _ error) {
-	f.tx.Lock()
-	defer f.tx.Unlock()
-
-	if f.tx.state != txLoad {
-		panic(fmt.Sprintf("client protocol error: FlushThenStore is invalid in state %v", f.tx.state))
-	}
-
-	f.shared.Lock()
-	defer f.shared.Unlock()
-
-	// We hold both the |f.tx| and |f.shared| locks during the store phase.
-	// The read loop accesses |f.shared| to handled Loaded responses,
-	// but those are disallowed at this stage of the protocol.
-
+func (c *TxnClient) Store() ([]*pf.CombineAPI_Stats, error) {
 	// Any remaining flighted keys *not* having `nil` values are retained documents
 	// of a prior transaction which were not updated during this one.
 	// We garbage collect them here, and achieve the drainBinding() precondition that
 	// flighted maps hold only keys of the current transaction with `nil` sentinels.
-	for _, flighted := range f.shared.flighted {
+	for _, flighted := range c.flighted {
 		for key, doc := range flighted {
 			if doc != nil {
 				delete(flighted, key)
@@ -328,15 +220,13 @@ func (f *TxnClient) Store() (_ []*pf.CombineAPI_Stats, _ error) {
 		}
 	}
 
-	var allStats = make([]*pf.CombineAPI_Stats, 0, len(f.shared.combiners))
+	var allStats = make([]*pf.CombineAPI_Stats, 0, len(c.combiners))
 	// Drain each binding.
-	for i, combiner := range f.shared.combiners {
-		if stats, err := drainBinding(
-			f.shared.flighted[i],
+	for i, combiner := range c.combiners {
+		if stats, err := c.drainBinding(
+			c.flighted[i],
 			combiner,
-			f.spec.Bindings[i].DeltaUpdates,
-			f.tx.client,
-			&f.tx.staged,
+			c.spec.Bindings[i].DeltaUpdates,
 			i,
 		); err != nil {
 			return nil, err
@@ -344,237 +234,62 @@ func (f *TxnClient) Store() (_ []*pf.CombineAPI_Stats, _ error) {
 			allStats = append(allStats, stats)
 		}
 	}
-}
 
-// StartCommit of the prepared transaction. The CommitOps must be initialized by the caller.
-// The caller must arrange for LogCommitted to be resolved appropriately, after DriverCommitted.
-// The *TxnClient will resolve DriverCommitted & Acknowledged.
-func (f *TxnClient) StartCommit(flowCP pf.Checkpoint) (driverCP pf.DriverCheckpoint, __out error) {
-	// If |ops| futures are non-nil on return, we failed to send them to readLoop
-	// and must resolve them now.
-	defer func() {
-		if ops.Acknowledged != nil {
-			ops.Acknowledged.Resolve(__out)
-		}
-	}()
-
-	f.tx.Lock()
-	defer f.tx.Unlock()
-
-	if f.tx.state != txPrepare {
-		panic(fmt.Sprintf("client protocol error: StartCommit is invalid in state %v", f.tx.state))
-	}
-
-	f.shared.Lock()
-	defer f.shared.Unlock()
-
-	// We hold both the |f.tx| and |f.shared| locks during the store phase.
-	// The read loop accesses |f.shared| to handled Loaded responses,
-	// but those are disallowed at this stage of the protocol.
-
-	// Inform read loop of new CommitOps.
-	select {
-	case f.tx.commitOpsCh <- ops:
-		ops = CommitOps{} // Ownership is transferred to readLoop().
-	case <-f.rx.loopOp.Done():
-		return nil, f.rx.loopOp.Err()
-	}
-
-	// Tell the driver to commit.
-	if err := WriteStartCommit(f.tx.client, &f.tx.staged); err != nil {
-		return nil, err
-	}
-
-	f.tx.state = txLoadCommit
 	return allStats, nil
 }
 
-func (f *TxnClient) onLogCommitted() error {
-	if err := f.rx.commitOps.LogCommitted.Err(); err != nil {
-		return fmt.Errorf("recovery log commit: %w", err)
+func (c *TxnClient) StartCommit(runtimeCP pf.Checkpoint) (_ pf.DriverCheckpoint, acknowledged client.OpFuture, _ error) {
+	var driverCP pf.DriverCheckpoint
+
+	if err := WriteStartCommit(c.client, &c.txRequest, runtimeCP); err != nil {
+		return pf.DriverCheckpoint{}, nil, c.writeErr(err)
+	} else if driverCP, err = ReadStartedCommit(c.client, &c.rxResponse); err != nil {
+		return pf.DriverCheckpoint{}, nil, err
 	}
-	f.rx.commitOps.LogCommitted = nil // Don't receive again.
 
-	// It's technically _possible_ that a deadlock could occur here.
-	// It would require either:
-	//  a) that the driver isn't reading Load messages at all, which is
-	//     explicitly against the API contract, or
-	//  b) that both driver and server managed to stuff their channels
-	//     at the same time.
-	//
-	// It's pretty unlikely in practice. If it *does* occur, two solutions:
-	//  * Use a TryLock fast-path, and a slow-path that spawns a goroutine
-	//    (Mutex.TryLock should be available after Go 1.18+).
-	//  * Or, just always spawn a goroutine.
-	f.tx.Lock()
-	defer f.tx.Unlock()
+	// TODO(johnny): remove when Flush can no longer contain a driver checkpoint.
+	if len(driverCP.DriverCheckpointJson) == 0 {
+		driverCP = c.deprecatedDriverCP
+	}
 
-	if err := WriteAcknowledge(f.tx.client, &f.tx.staged); err != nil {
+	c.opLoaded = client.NewAsyncOperation()
+	var opAcknowledged = client.NewAsyncOperation()
+	go c.readAcknowledgedAndLoaded(opAcknowledged)
+
+	return driverCP, opAcknowledged, nil
+}
+
+func (c *TxnClient) Acknowledge() error {
+	if err := WriteAcknowledge(c.client, &c.txRequest); err != nil {
+		return c.writeErr(err)
+	}
+	return nil
+}
+
+func (c *TxnClient) writeErr(err error) error {
+	// EOF indicates a stream break, which returns a causal error only with RecvMsg.
+	if err != io.EOF {
 		return err
 	}
-	f.tx.state = txLoadAcknowledge
-	return nil
-}
-
-func (f *TxnClient) readLoop() (__out error) {
-	if f.rx.state != rxAcknowledged {
-		panic(f.rx.state)
+	// If opLoaded != nil then readAcknowledgedAndLoaded is running.
+	// It will (or has) read an error, and we should wait for it.
+	if c.opLoaded != nil {
+		return c.opLoaded.Err()
 	}
-
-	defer func() {
-		f.rx.loopOp.Resolve(__out)
-
-		// These can never succeed, since we're no longer looping.
-		if f.rx.commitOps.DriverCommitted != nil {
-			f.rx.commitOps.DriverCommitted.Resolve(__out)
-		}
-		if f.rx.commitOps.Acknowledged != nil {
-			f.rx.commitOps.Acknowledged.Resolve(__out)
-		}
-	}()
-
+	// Otherwise we must synchronously read the error.
 	for {
-		var maybeLogCommitted <-chan struct{}
-		if f.rx.commitOps.LogCommitted != nil {
-			maybeLogCommitted = f.rx.commitOps.LogCommitted.Done()
-		}
-
-		select {
-		case <-maybeLogCommitted:
-			if err := f.onLogCommitted(); err != nil {
-				return fmt.Errorf("onLogCommitted: %w", err)
-			}
-			logrus.Debug("read log commit")
-
-		case ops := <-f.rx.commitOpsCh:
-			if err := f.onCommitOps(ops); err != nil {
-				return fmt.Errorf("onCommitOps: %w", err)
-			}
-			logrus.Debug("read CommitOps")
-
-		case rx, ok := <-f.rx.respCh:
-			if !ok {
-				return io.EOF
-			} else if rx.Error != nil {
-				return rx.Error
-			} else if err := rx.Validate(); err != nil {
-				return err
-			}
-
-			switch {
-			case rx.DriverCommitted != nil:
-				logrus.Debug("read DriverCommitted")
-				if err := f.onDriverCommitted(*rx.DriverCommitted); err != nil {
-					return fmt.Errorf("onDriverCommitted: %w", err)
-				}
-			case rx.Loaded != nil:
-				logrus.Debug("read Loaded")
-				if err := f.onLoaded(*rx.Loaded); err != nil {
-					return fmt.Errorf("onLoaded: %w", err)
-				}
-			case rx.Acknowledged != nil:
-				logrus.Debug("read Acknowledged")
-				if err := f.onAcknowledged(*rx.Acknowledged); err != nil {
-					return fmt.Errorf("onAcknowledged: %w", err)
-				}
-			case rx.Prepared != nil:
-				logrus.Debug("read Prepared")
-				if err := f.onPrepared(*rx.Prepared); err != nil {
-					return fmt.Errorf("onPrepared: %w", err)
-				}
-			default:
-				return fmt.Errorf("read unexpected response: %v", rx)
-			}
+		if _, err = c.client.Recv(); err != nil {
+			return err
 		}
 	}
-}
-
-func (f *TxnClient) onDriverCommitted(TransactionResponse_DriverCommitted) error {
-	if f.rx.state != rxPendingCommit {
-		return fmt.Errorf("connector protocol error (DriverCommitted not expected in state %v)", f.rx.state)
-	}
-
-	// This future was used as a recovery log write dependency by StartCommit of
-	// the last transaction. Resolving it allows that recovery log write to proceed,
-	// which we'll observe as a future resolution of fsm.logCommittedOp.
-	f.rx.commitOps.DriverCommitted.Resolve(nil)
-	f.rx.commitOps.DriverCommitted = nil
-
-	f.rx.state = rxDriverCommitted
-	return nil
-}
-
-func (f *TxnClient) onLoaded(loaded TransactionResponse_Loaded) error {
-	switch f.rx.state {
-	case rxDriverCommitted, rxAcknowledged:
-		// Pass.
-	default:
-		return fmt.Errorf("connector protocol error (Loaded not expected in state %v)", f.rx.state)
-	}
-
-	f.shared.Lock()
-	defer f.shared.Unlock()
-
-	if int(loaded.Binding) > len(f.shared.combiners) {
-		return fmt.Errorf("driver error (binding %d out of range)", loaded.Binding)
-	}
-
-	// Feed documents into the combiner as reduce-left operations.
-	var combiner = f.shared.combiners[loaded.Binding]
-	for _, slice := range loaded.DocsJson {
-		if err := combiner.ReduceLeft(loaded.Arena.Bytes(slice)); err != nil {
-			return fmt.Errorf("combiner.ReduceLeft: %w", err)
-		}
-	}
-
-	// f.rx.state is unchanged.
-	return nil
-}
-
-func (f *TxnClient) onAcknowledged(TransactionResponse_Acknowledged) error {
-	if f.rx.state != rxDriverCommitted {
-		return fmt.Errorf("connector protocol error (Acknowledged not expected in state %v)", f.rx.state)
-	}
-
-	// This future was returned by StartCommit of the last transaction.
-	// Gazette holds the current transaction open until it resolves.
-	f.rx.commitOps.Acknowledged.Resolve(nil)
-	f.rx.commitOps.Acknowledged = nil
-
-	f.rx.state = rxAcknowledged
-	return nil
-}
-
-func (f *TxnClient) onPrepared(prepared pf.DriverCheckpoint) error {
-	if f.rx.state != rxAcknowledged {
-		return fmt.Errorf("connector protocol error (Prepared not expected in state %v)", f.rx.state)
-	}
-
-	// Tell synchronous Client.Prepare() of this response.
-	f.rx.preparedCh <- prepared
-
-	f.rx.state = rxPrepared
-	return nil
-}
-
-func (f *TxnClient) onCommitOps(ops CommitOps) error {
-	if f.rx.state != rxPrepared {
-		panic(fmt.Sprintf("client protocol error (StartCommit not expected in state %v)", f.rx.state))
-	}
-
-	f.rx.commitOps = ops
-	f.rx.state = rxPendingCommit
-	return nil
 }
 
 // drainBinding drains the Combiner of the specified materialization
 // binding by sending Store requests for its reduced documents.
-func drainBinding(
+func (c *TxnClient) drainBinding(
 	flighted map[string]json.RawMessage,
 	combiner pf.Combiner,
 	deltaUpdates bool,
-	driverTx Driver_TransactionsClient,
-	request **TransactionRequest,
 	binding int,
 ) (*pf.CombineAPI_Stats, error) {
 	// Precondition: |flighted| contains the precise set of keys for this binding in this transaction.
@@ -600,8 +315,8 @@ func drainBinding(
 		// document was provided by Loaded or was retained from a previous
 		// transaction's Store.
 
-		if err := StageStore(driverTx, request, binding, packedKey, packedValues, docRaw, full); err != nil {
-			return err
+		if err := WriteStore(c.client, &c.txRequest, binding, packedKey, packedValues, docRaw, full); err != nil {
+			return c.writeErr(err)
 		}
 
 		// We can retain a bounded number of documents from this transaction
@@ -614,7 +329,7 @@ func drainBinding(
 			// Fortunately, StageStore did just that, appending the document
 			// to the staged request Arena, which we can reference here because
 			// Arena bytes are write-once.
-			var s = (*request).Store
+			var s = c.txRequest.Store
 			flighted[string(packedKey)] = s.Arena.Bytes(s.DocsJson[len(s.DocsJson)-1])
 		}
 
@@ -635,6 +350,49 @@ func drainBinding(
 	}
 
 	return stats, nil
+}
+
+func (c *TxnClient) readAcknowledgedAndLoaded(opAcknowledged *client.AsyncOperation) (__err error) {
+	defer func() {
+		if opAcknowledged != nil {
+			opAcknowledged.Resolve(__err)
+		}
+		c.opLoaded.Resolve(__err)
+	}()
+
+	if err := ReadAcknowledged(c.client, &c.rxResponse); err != nil {
+		return err
+	}
+
+	opAcknowledged.Resolve(nil)
+	opAcknowledged = nil // Don't resolve again.
+
+	c.combinersMu.Lock()
+	defer c.combinersMu.Unlock()
+
+	for {
+		c.combinersMu.Unlock()
+		var loaded, err = ReadLoaded(c.client, &c.rxResponse)
+		c.combinersMu.Lock()
+
+		if err != nil {
+			return err
+		} else if loaded == nil {
+			return nil
+		}
+
+		if int(loaded.Binding) > len(c.combiners) {
+			return fmt.Errorf("driver implementation error (binding %d out of range)", loaded.Binding)
+		}
+
+		// Feed documents into the combiner as reduce-left operations.
+		var combiner = c.combiners[loaded.Binding]
+		for _, slice := range loaded.DocsJson {
+			if err := combiner.ReduceLeft(loaded.Arena.Bytes(slice)); err != nil {
+				return fmt.Errorf("combiner.ReduceLeft: %w", err)
+			}
+		}
+	}
 }
 
 // TODO(johnny): This is an interesting knob we may want expose.
