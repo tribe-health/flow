@@ -3,6 +3,7 @@ package materialize
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	math "math"
@@ -112,7 +113,15 @@ func OpenTransactions(
 		// TODO(johnny): Remove me.
 		deprecatedDriverCP: pf.DriverCheckpoint{},
 	}
-	go c.readAcknowledgedAndLoaded(client.NewAsyncOperation())
+
+	var initialAcknowledged = client.NewAsyncOperation()
+	go c.readAcknowledgedAndLoaded(initialAcknowledged)
+
+	// We must block until the very first Acknowledged is read (or errors).
+	// If we didn't do this, then TxnClient.Flush could potentially
+	// be called (and write Flush) before the first Acknowledged is read,
+	// which is a protocol violation.
+	<-initialAcknowledged.Done()
 
 	rpc = nil // Don't run deferred CloseSend.
 	return c, nil
@@ -268,7 +277,7 @@ func (c *TxnClient) Acknowledge() error {
 
 func (c *TxnClient) writeErr(err error) error {
 	// EOF indicates a stream break, which returns a causal error only with RecvMsg.
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		return err
 	}
 	// If opLoaded != nil then readAcknowledgedAndLoaded is running.

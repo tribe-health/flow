@@ -1,14 +1,17 @@
 package materialize
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/estuary/flow/go/protocols/fdb/tuple"
-	"github.com/estuary/flow/go/protocols/flow"
 	pf "github.com/estuary/flow/go/protocols/flow"
 	pc "go.gazette.dev/core/consumer/protocol"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
 )
 
 // Protocol routines for sending TransactionRequest follow:
@@ -196,6 +199,7 @@ func WriteStartCommit(
 // Protocol routines for receiving TransactionRequest follow:
 
 type TransactionRequestRx interface {
+	Context() context.Context
 	RecvMsg(interface{}) error
 }
 
@@ -207,7 +211,7 @@ func ReadOpen(stream TransactionRequestRx) (TransactionRequest, error) {
 	} else if request.Open == nil {
 		return TransactionRequest{}, fmt.Errorf("protocol error (expected Open, got %#v)", request)
 	} else if err = request.Validate(); err != nil {
-		return TransactionRequest{}, fmt.Errorf("validating read Open: %w", err)
+		return TransactionRequest{}, fmt.Errorf("validation failed: %w", err)
 	}
 	return request, nil
 }
@@ -216,114 +220,160 @@ func ReadAcknowledge(stream TransactionRequestRx, request *TransactionRequest) e
 	if request.Open == nil && request.StartCommit == nil {
 		panic(fmt.Sprintf("expected prior request is Open or StartCommit, got %#v", request))
 	} else if err := stream.RecvMsg(request); err != nil {
-		return fmt.Errorf("reading expected Acknowledge: %w", err)
+		return fmt.Errorf("reading Acknowledge: %w", err)
 	} else if request.Acknowledge == nil {
 		return fmt.Errorf("protocol error (expected Acknowledge, got %#v)", request)
 	} else if err = request.Validate(); err != nil {
-		return fmt.Errorf("validating read Acknowledge: %w", err)
+		return fmt.Errorf("validation failed: %w", err)
 	}
 	return nil
 }
 
-type Load struct {
-	Binding int         // Binding index of this document to load.
-	Key     tuple.Tuple // Key of the next document to load.
+// LoadIterator is an iterator over Load requests.
+type LoadIterator struct {
+	Binding   int         // Binding index of this document to load.
+	Key       tuple.Tuple // Key of the document to load.
+	PackedKey []byte      // PackedKey of the document to load.
+
+	stream  TransactionRequestRx
+	request *TransactionRequest // Request read into.
+	index   int                 // Last-returned document index within `request`.
+	total   int                 // Total number of iterated keys.
+	err     error               // Terminal error.
 }
 
-func ReadLoad(stream TransactionRequestRx, request *TransactionRequest) (_ Load, ok bool, _ error) {
-	if request.Acknowledge == nil && request.Load == nil {
-		panic(fmt.Sprintf("expected prior request is Acknowledge or Load, got %#v", request))
+// Context returns the Context of this LoadIterator.
+func (it *LoadIterator) Context() context.Context { return it.stream.Context() }
+
+// Next returns true if there is another Load and makes it available.
+// When no Loads remain, or if an error is encountered, it returns false
+// and must not be called again.
+func (it *LoadIterator) Next() bool {
+	if it.request.Acknowledge == nil && it.request.Load == nil {
+		panic(fmt.Sprintf("expected prior request is Acknowledge or Load, got %#v", it.request))
 	}
 	// Read next `Load` request from `stream`?
-	if request.Acknowledge != nil || len(request.Load.PackedKeys) == 0 {
-		if err := stream.RecvMsg(request); err == io.EOF && request.Acknowledge != nil {
-			return Load{}, false, io.EOF // Clean shutdown.
+	if it.request.Acknowledge != nil || it.index == len(it.request.Load.PackedKeys) {
+		if err := it.stream.RecvMsg(it.request); err == io.EOF {
+			if it.total != 0 {
+				it.err = fmt.Errorf("unexpected EOF when there are loaded keys")
+			} else {
+				it.err = io.EOF // Clean shutdown.
+			}
+			return false
 		} else if err != nil {
-			return Load{}, false, fmt.Errorf("reading Load: %w", err)
-		} else if request.Load == nil {
-			return Load{}, false, nil // No loads remain.
-		} else if err = request.Validate(); err != nil {
-			return Load{}, false, fmt.Errorf("validating read Load: %w", err)
+			it.err = fmt.Errorf("reading Load: %w", err)
+			return false
+		} else if it.request.Load == nil {
+			return false // No loads remain.
+		} else if err = it.request.Validate(); err != nil {
+			it.err = fmt.Errorf("validation failed: %w", err)
+			return false
 		}
-	}
-	var l = request.Load
-
-	var key, err = tuple.Unpack(l.Arena.Bytes(l.PackedKeys[0]))
-	if err != nil {
-		return Load{}, false, fmt.Errorf("unpacking Load key: %w", err)
+		it.index = 0
+		it.Binding = int(it.request.Load.Binding)
 	}
 
-	l.PackedKeys = l.PackedKeys[1:]
+	var l = it.request.Load
 
-	return Load{
-		Binding: int(l.Binding),
-		Key:     key,
-	}, true, nil
+	it.PackedKey = l.Arena.Bytes(l.PackedKeys[it.index])
+	it.Key, it.err = tuple.Unpack(it.PackedKey)
+
+	if it.err != nil {
+		it.err = fmt.Errorf("unpacking Load key: %w", it.err)
+		return false
+	}
+
+	it.index++
+	it.total++
+	return true
+}
+
+// Err returns an encountered error.
+func (it *LoadIterator) Err() error {
+	return it.err
 }
 
 func ReadFlush(request *TransactionRequest) error {
 	if request.Flush == nil {
 		return fmt.Errorf("protocol error (expected Flush, got %#v)", request)
 	} else if err := request.Validate(); err != nil {
-		return fmt.Errorf("validating read Flush: %w", err)
+		return fmt.Errorf("validation failed: %w", err)
 	}
 	return nil
 }
 
-type Store struct {
-	Binding int             // Binding index of this stored document.
-	Key     tuple.Tuple     // Key of the next document to store.
-	Values  tuple.Tuple     // Values of the next document to store.
-	RawJSON json.RawMessage // Document to store.
-	Exists  bool            // Does this document exist in the store already?
+// StoreIterator is an iterator over Store requests.
+type StoreIterator struct {
+	Binding   int             // Binding index of this stored document.
+	Exists    bool            // Does this document exist in the store already?
+	Key       tuple.Tuple     // Key of the document to store.
+	PackedKey []byte          // PackedKey of the document to store.
+	RawJSON   json.RawMessage // Document to store.
+	Values    tuple.Tuple     // Values of the document to store.
+
+	stream  TransactionRequestRx
+	request *TransactionRequest // Request read into.
+	index   int                 // Last-returned document index within `request`
+	total   int                 // Total number of iterated stores.
+	err     error               // Terminal error.
 }
 
-func ReadStore(stream TransactionRequestRx, request *TransactionRequest) (_ Store, ok bool, _ error) {
-	if request.Flush == nil && request.Store == nil {
-		panic(fmt.Sprintf("expected prior request is Flush or Store, got %#v", request))
+// Context returns the Context of this StoreIterator.
+func (it *StoreIterator) Context() context.Context { return it.stream.Context() }
+
+// Next returns true if there is another Store and makes it available.
+// When no Stores remain, or if an error is encountered, it returns false
+// and must not be called again.
+func (it *StoreIterator) Next() bool {
+	if it.request.Flush == nil && it.request.Store == nil {
+		panic(fmt.Sprintf("expected prior request is Flush or Store, got %#v", it.request))
 	}
 	// Read next `Store` request from `stream`?
-	if request.Flush != nil || len(request.Store.PackedKeys) == 0 {
-		if err := stream.RecvMsg(request); err != nil {
-			return Store{}, false, fmt.Errorf("reading Store: %w", err)
-		} else if request.Store == nil {
-			return Store{}, false, nil // No stores remain.
-		} else if err = request.Validate(); err != nil {
-			return Store{}, false, fmt.Errorf("validating read Store: %w", err)
+	if it.request.Flush != nil || it.index == len(it.request.Store.PackedKeys) {
+		if err := it.stream.RecvMsg(it.request); err != nil {
+			it.err = fmt.Errorf("reading Store: %w", err)
+			return false
+		} else if it.request.Store == nil {
+			return false // No stores remain.
+		} else if err = it.request.Validate(); err != nil {
+			it.err = fmt.Errorf("validation failed: %w", err)
 		}
+		it.index = 0
+		it.Binding = int(it.request.Store.Binding)
 	}
-	var s = request.Store
 
-	var key, err = tuple.Unpack(s.Arena.Bytes(s.PackedKeys[0]))
-	if err != nil {
-		return Store{}, false, fmt.Errorf("unpacking Store key: %w", err)
+	var s = it.request.Store
+
+	it.PackedKey = s.Arena.Bytes(s.PackedKeys[it.index])
+	it.Key, it.err = tuple.Unpack(it.PackedKey)
+	if it.err != nil {
+		it.err = fmt.Errorf("unpacking Store key: %w", it.err)
+		return false
 	}
-	values, err := tuple.Unpack(s.Arena.Bytes(s.PackedValues[0]))
-	if err != nil {
-		return Store{}, false, fmt.Errorf("unpacking Store values: %w", err)
+	it.Values, it.err = tuple.Unpack(s.Arena.Bytes(s.PackedValues[it.index]))
+	if it.err != nil {
+		it.err = fmt.Errorf("unpacking Store values: %w", it.err)
+		return false
 	}
-	var rawJSON = s.Arena.Bytes(s.DocsJson[0])
-	var exists = s.Exists[0]
+	it.RawJSON = s.Arena.Bytes(s.DocsJson[it.index])
+	it.Exists = s.Exists[it.index]
 
-	s.PackedKeys = s.PackedKeys[1:]
-	s.PackedValues = s.PackedValues[1:]
-	s.DocsJson = s.DocsJson[1:]
-	s.Exists = s.Exists[1:]
+	it.index++
+	it.total++
+	return true
+}
 
-	return Store{
-		Binding: int(s.Binding),
-		Key:     key,
-		Values:  values,
-		RawJSON: rawJSON,
-		Exists:  exists,
-	}, true, nil
+// Err returns an encountered error.
+func (it *StoreIterator) Err() error {
+	return it.err
 }
 
 func ReadStartCommit(request *TransactionRequest) (runtimeCheckpoint []byte, _ error) {
 	if request.StartCommit == nil {
 		return nil, fmt.Errorf("protocol error (expected StartCommit, got %#v)", request)
 	} else if err := request.Validate(); err != nil {
-		return nil, fmt.Errorf("validating read StartCommit: %w", err)
+		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 	return request.StartCommit.RuntimeCheckpoint, nil
 }
@@ -412,7 +462,7 @@ func WriteFlushed(stream TransactionResponseTx, response *TransactionResponse) e
 
 	*response = TransactionResponse{
 		// Flushed as-a DriverCheckpoint is deprecated and will be removed.
-		Flushed: &flow.DriverCheckpoint{
+		Flushed: &pf.DriverCheckpoint{
 			DriverCheckpointJson: []byte("{}"),
 			Rfc7396MergePatch:    true,
 		},
@@ -452,11 +502,14 @@ func ReadOpened(stream TransactionResponseRx) (TransactionResponse, error) {
 	var response TransactionResponse
 
 	if err := stream.RecvMsg(&response); err != nil {
+		if status, ok := status.FromError(err); ok && status.Code() == codes.Internal {
+			err = errors.New(status.Message())
+		}
 		return TransactionResponse{}, fmt.Errorf("reading Opened: %w", err)
 	} else if response.Opened == nil {
 		return TransactionResponse{}, fmt.Errorf("protocol error (expected Opened, got %#v)", response)
 	} else if err = response.Validate(); err != nil {
-		return TransactionResponse{}, fmt.Errorf("validating read Opened: %w", err)
+		return TransactionResponse{}, fmt.Errorf("validation failed: %w", err)
 	}
 	return response, nil
 }
@@ -465,11 +518,14 @@ func ReadAcknowledged(stream TransactionResponseRx, response *TransactionRespons
 	if response.Opened == nil && response.StartedCommit == nil {
 		panic(fmt.Sprintf("expected prior response is Opened or StartedCommit, got %#v", response))
 	} else if err := stream.RecvMsg(response); err != nil {
-		return fmt.Errorf("reading expected Acknowledge: %w", err)
+		if status, ok := status.FromError(err); ok && status.Code() == codes.Internal {
+			err = errors.New(status.Message())
+		}
+		return fmt.Errorf("reading Acknowledged: %w", err)
 	} else if response.Acknowledged == nil {
 		return fmt.Errorf("protocol error (expected Acknowledged, got %#v)", response)
 	} else if err = response.Validate(); err != nil {
-		return fmt.Errorf("validating read Acknowledged: %w", err)
+		return fmt.Errorf("validation failed: %w", err)
 	}
 	return nil
 }
@@ -477,12 +533,17 @@ func ReadAcknowledged(stream TransactionResponseRx, response *TransactionRespons
 func ReadLoaded(stream TransactionResponseRx, response *TransactionResponse) (*TransactionResponse_Loaded, error) {
 	if response.Acknowledged == nil && response.Loaded == nil {
 		panic(fmt.Sprintf("expected prior response is Acknowledged or Loaded, got %#v", response))
-	} else if err := stream.RecvMsg(response); err != nil {
+	} else if err := stream.RecvMsg(response); err == io.EOF && response.Acknowledged != nil {
+		return nil, io.EOF // Clean EOF.
+	} else if err != nil {
+		if status, ok := status.FromError(err); ok && status.Code() == codes.Internal {
+			err = errors.New(status.Message())
+		}
 		return nil, fmt.Errorf("reading Loaded: %w", err)
 	} else if response.Loaded == nil {
 		return nil, nil // No loads remain.
 	} else if err = response.Validate(); err != nil {
-		return nil, fmt.Errorf("validating read Loaded: %w", err)
+		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 	return response.Loaded, nil
 }
@@ -491,7 +552,7 @@ func ReadFlushed(response *TransactionResponse) (deprecatedDriverCP pf.DriverChe
 	if response.Flushed == nil {
 		return pf.DriverCheckpoint{}, fmt.Errorf("protocol error (expected Flushed, got %#v)", response)
 	} else if err := response.Validate(); err != nil {
-		return pf.DriverCheckpoint{}, fmt.Errorf("validating read Flushed: %w", err)
+		return pf.DriverCheckpoint{}, fmt.Errorf("validation failed: %w", err)
 	}
 	return *response.Flushed, nil
 }
@@ -500,11 +561,14 @@ func ReadStartedCommit(stream TransactionResponseRx, response *TransactionRespon
 	if response.Flushed == nil {
 		panic(fmt.Sprintf("expected prior response is Flushed, got %#v", response))
 	} else if err := stream.RecvMsg(response); err != nil {
-		return pf.DriverCheckpoint{}, fmt.Errorf("reading expected StartedCommit: %w", err)
+		if status, ok := status.FromError(err); ok && status.Code() == codes.Internal {
+			err = errors.New(status.Message())
+		}
+		return pf.DriverCheckpoint{}, fmt.Errorf("reading StartedCommit: %w", err)
 	} else if response.StartedCommit == nil {
 		return pf.DriverCheckpoint{}, fmt.Errorf("protocol error (expected StartedCommit, got %#v)", response)
 	} else if err = response.Validate(); err != nil {
-		return pf.DriverCheckpoint{}, fmt.Errorf("validating read StartedCommit: %w", err)
+		return pf.DriverCheckpoint{}, fmt.Errorf("validation failed: %w", err)
 	}
 	return *response.StartedCommit.DriverCheckpoint, nil
 }

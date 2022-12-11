@@ -6,12 +6,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/estuary/flow/go/materialize/driver/sqlite"
 	"github.com/estuary/flow/go/ops"
 	pc "github.com/estuary/flow/go/protocols/capture"
 	pf "github.com/estuary/flow/go/protocols/flow"
 	pm "github.com/estuary/flow/go/protocols/materialize"
-	sqlDriver "github.com/estuary/flow/go/protocols/materialize/sql"
 	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -20,7 +18,6 @@ import (
 // Driver encapsulates the various ways in which we drive connectors:
 // * As a linux container.
 // * As a push-based ingestion.
-// * As an embedded SQLite DB (deprecated; will be removed).
 //
 // Depending on how a connector is configured, Driver also handles required
 // "unwrapping" of the connector's endpoint configuration. For example,
@@ -31,7 +28,6 @@ type Driver struct {
 	// A "remote: *grpc.ClientConn" variant may be added in the future if there's a well-defined use case.
 	container *Container
 	ingest    *ingestClient
-	sqlite    *sqlDriver.Driver
 
 	// Unwrapped configuration of the endpoint.
 	config json.RawMessage
@@ -59,15 +55,6 @@ func NewDriver(
 	network string,
 ) (*Driver, error) {
 
-	if endpointType == pf.EndpointType_SQLITE {
-		return &Driver{
-			container: nil,
-			ingest:    nil,
-			sqlite:    sqlite.NewSQLiteDriver(),
-			config:    endpointSpec,
-		}, nil
-	}
-
 	// TODO(johnny): These differentiated endpoint types are inaccurate and meaningless now.
 	// They both now mean simply "run a docker image".
 	if endpointType == pf.EndpointType_AIRBYTE_SOURCE || endpointType == pf.EndpointType_FLOW_SINK {
@@ -84,7 +71,6 @@ func NewDriver(
 		return &Driver{
 			container: container,
 			ingest:    nil,
-			sqlite:    nil,
 			config:    parsedSpec.Config,
 		}, nil
 	}
@@ -93,7 +79,6 @@ func NewDriver(
 		return &Driver{
 			container: nil,
 			ingest:    new(ingestClient),
-			sqlite:    nil,
 			config:    endpointSpec,
 		}, nil
 	}
@@ -106,8 +91,6 @@ func NewDriver(
 func (d *Driver) MaterializeClient() pm.DriverClient {
 	if d.container != nil {
 		return pm.NewDriverClient(d.container.conn)
-	} else if d.sqlite != nil {
-		return pm.AdaptServerToClient(d.sqlite)
 	} else {
 		panic("invalid driver type for materialization")
 	}
@@ -131,8 +114,6 @@ func (d *Driver) Close() error {
 	if d.container != nil {
 		err = d.container.Stop()
 	} else if d.ingest != nil {
-		err = nil // Nothing to close.
-	} else if d.sqlite != nil {
 		err = nil // Nothing to close.
 	}
 

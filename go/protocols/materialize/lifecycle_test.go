@@ -9,7 +9,6 @@ import (
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/estuary/flow/go/protocols/fdb/tuple"
 	pf "github.com/estuary/flow/go/protocols/flow"
-	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,29 +59,23 @@ func TestStreamLifecycle(t *testing.T) {
 		// Deprecated checkpoint, to be removed.
 		pf.Checkpoint{AckIntents: map[pf.Journal][]byte{"deprecated": nil}}))
 
-	var requireLoad = func(load Load, ok bool, err error, binding int, expect tuple.Tuple) {
-		require.NoError(t, err)
-		require.True(t, ok)
-		require.Equal(t, binding, load.Binding)
-		require.Equal(t, expect, load.Key)
-	}
-
 	// Driver reads Loads.
-	load, ok, err := ReadLoad(srvRPC, &rxRequest)
-	requireLoad(load, ok, err, 0, tuple.Tuple{"key-1"})
-	load, ok, err = ReadLoad(srvRPC, &rxRequest)
-	requireLoad(load, ok, err, 1, tuple.Tuple{int64(2)})
-	load, ok, err = ReadLoad(srvRPC, &rxRequest)
-	requireLoad(load, ok, err, 1, tuple.Tuple{int64(-3)})
-	load, ok, err = ReadLoad(srvRPC, &rxRequest)
-	requireLoad(load, ok, err, 1, tuple.Tuple{"four"})
-	load, ok, err = ReadLoad(srvRPC, &rxRequest)
-	requireLoad(load, ok, err, 0, tuple.Tuple{[]byte("five")})
-	_, ok, err = ReadLoad(srvRPC, &rxRequest)
-	require.False(t, ok)
-	require.Nil(t, err)
+	var it = &LoadIterator{stream: srvRPC, request: &rxRequest}
+	require.True(t, it.Next())
+	require.Equal(t, tuple.Tuple{"key-1"}, it.Key)
+	require.True(t, it.Next())
+	require.Equal(t, tuple.Tuple{int64(2)}, it.Key)
+	require.True(t, it.Next())
+	require.Equal(t, tuple.Tuple{int64(-3)}, it.Key)
+	require.True(t, it.Next())
+	require.Equal(t, tuple.Tuple{"four"}, it.Key)
+	require.True(t, it.Next())
+	require.Equal(t, tuple.Tuple{[]byte("five")}, it.Key)
+	require.False(t, it.Next())
+	require.Nil(t, it.Err())
 
-	// Driver responds with Loaded, then Flushed.
+	// Driver reads Flush, and responds with Loaded and then Flushed.
+	require.NoError(t, ReadFlush(&rxRequest))
 	require.NoError(t, WriteLoaded(srvRPC, &txResponse, 0, []byte(`loaded-1`)))
 	require.NoError(t, WriteLoaded(srvRPC, &txResponse, 0, []byte(`loaded-2`)))
 	require.NoError(t, WriteLoaded(srvRPC, &txResponse, 2, []byte(`loaded-3`)))
@@ -115,26 +108,31 @@ func TestStreamLifecycle(t *testing.T) {
 	require.NoError(t, WriteStartCommit(cliRPC, &txRequest, pf.Checkpoint{
 		AckIntents: map[pf.Journal][]byte{"a-checkpoint": nil}}))
 
-	var requireStore = func(store Store, ok bool, err error, binding int, key, values tuple.Tuple, raw string, exists bool) {
-		require.NoError(t, err)
-		require.True(t, ok)
-		require.Equal(t, binding, store.Binding)
-		require.Equal(t, key, store.Key)
-		require.Equal(t, values, store.Values)
-		require.Equal(t, raw, string(store.RawJSON))
-		require.Equal(t, exists, store.Exists)
-	}
-
 	// Driver reads stores.
-	store, ok, err := ReadStore(srvRPC, &rxRequest)
-	requireStore(store, ok, err, 0, tuple.Tuple{"key-1"}, tuple.Tuple{false}, "doc-1", true)
-	store, ok, err = ReadStore(srvRPC, &rxRequest)
-	requireStore(store, ok, err, 0, tuple.Tuple{"key", int64(2)}, tuple.Tuple{"two"}, "doc-2", false)
-	store, ok, err = ReadStore(srvRPC, &rxRequest)
-	requireStore(store, ok, err, 1, tuple.Tuple{"three"}, tuple.Tuple{true}, "doc-3", true)
-	_, ok, err = ReadStore(srvRPC, &rxRequest)
-	require.False(t, ok)
-	require.Nil(t, err)
+	var sit = &StoreIterator{stream: srvRPC, request: &rxRequest}
+	require.True(t, sit.Next())
+	require.Equal(t, 0, sit.Binding)
+	require.Equal(t, tuple.Tuple{"key-1"}, sit.Key)
+	require.Equal(t, tuple.Tuple{false}, sit.Values)
+	require.Equal(t, []byte(`doc-1`), []byte(sit.RawJSON))
+	require.Equal(t, true, sit.Exists)
+
+	require.True(t, sit.Next())
+	require.Equal(t, 0, sit.Binding)
+	require.Equal(t, tuple.Tuple{"key", int64(2)}, sit.Key)
+	require.Equal(t, tuple.Tuple{"two"}, sit.Values)
+	require.Equal(t, []byte(`doc-2`), []byte(sit.RawJSON))
+	require.Equal(t, false, sit.Exists)
+
+	require.True(t, sit.Next())
+	require.Equal(t, 1, sit.Binding)
+	require.Equal(t, tuple.Tuple{"three"}, sit.Key)
+	require.Equal(t, tuple.Tuple{true}, sit.Values)
+	require.Equal(t, []byte(`doc-3`), []byte(sit.RawJSON))
+	require.Equal(t, true, sit.Exists)
+
+	require.False(t, sit.Next())
+	require.Nil(t, sit.Err())
 
 	// Driver reads StartCommit.
 	runtimeCP, err := ReadStartCommit(&rxRequest)
@@ -188,7 +186,7 @@ func (s *clientStream) RecvMsg(out interface{}) error {
 		return io.EOF
 	}
 
-	*out.(*TransactionResponse) = *proto.Clone(&s.resp[s.respInd]).(*TransactionResponse)
+	*out.(*TransactionResponse) = s.resp[s.respInd]
 	s.respInd += 1
 	return nil
 }
@@ -198,7 +196,7 @@ func (s *srvStream) RecvMsg(out interface{}) error {
 		return io.EOF
 	}
 
-	*out.(*TransactionRequest) = *proto.Clone(&s.req[s.reqInd]).(*TransactionRequest)
+	*out.(*TransactionRequest) = s.req[s.reqInd]
 	s.reqInd += 1
 	return nil
 }

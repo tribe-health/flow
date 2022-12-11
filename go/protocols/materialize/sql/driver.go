@@ -43,8 +43,8 @@ type Driver struct {
 	NewEndpoint func(context.Context, json.RawMessage) (Endpoint, error)
 	// NewResource returns an uninitialized Resource which may be parsed into.
 	NewResource func(ep Endpoint) Resource
-	// RunTransactions runs a transactions over an opened TransactionsServer RPC stream.
-	RunTransactions func(pm.Driver_TransactionsServer, Endpoint, *pf.MaterializationSpec, Fence, []Resource) error
+	// NewTransactor returns a Transactor ready for pm.RunTransactions.
+	NewTransactor func(context.Context, Endpoint, *pf.MaterializationSpec, Fence, []Resource) (pm.Transactor, error)
 }
 
 var _ pm.DriverServer = &Driver{}
@@ -280,69 +280,62 @@ func (d *Driver) ApplyDelete(ctx context.Context, req *pm.ApplyRequest) (*pm.App
 
 // Transactions implements the DriverServer interface.
 func (d *Driver) Transactions(stream pm.Driver_TransactionsServer) error {
-	var open, err = stream.Recv()
-	if err != nil {
-		return fmt.Errorf("read Open: %w", err)
-	} else if open.Open == nil {
-		return fmt.Errorf("expected Open, got %#v", open)
-	}
+	return pm.RunTransactions(stream, func(open pm.TransactionRequest_Open) (pm.Transactor, pm.TransactionResponse_Opened, error) {
+		var opened pm.TransactionResponse_Opened
 
-	endpoint, err := d.NewEndpoint(
-		stream.Context(),
-		open.Open.Materialization.EndpointSpecJson,
-	)
-	if err != nil {
-		return fmt.Errorf("building endpoint: %w", err)
-	}
-
-	// Verify the opened materialization has been applied to the database,
-	// and that the versions match.
-	if version, spec, err := endpoint.LoadSpec(stream.Context(), open.Open.Materialization.Materialization); err != nil {
-		return fmt.Errorf("loading materialization spec: %w", err)
-	} else if spec == nil {
-		return fmt.Errorf("materialization has not been applied")
-	} else if version != open.Open.Version {
-		return fmt.Errorf(
-			"applied and current materializations are different versions (applied: %s vs current: %s)",
-			version, open.Open.Version)
-	}
-
-	fence, err := endpoint.NewFence(
-		stream.Context(),
-		open.Open.Materialization.Materialization,
-		open.Open.KeyBegin,
-		open.Open.KeyEnd,
-	)
-	if err != nil {
-		return fmt.Errorf("installing fence: %w", err)
-	}
-
-	// Parse resource specifications.
-	var resources []Resource
-	for _, spec := range open.Open.Materialization.Bindings {
-		if resource, err := parseResource(
-			d.NewResource(endpoint),
-			spec.ResourceSpecJson,
-			&spec.Collection,
-		); err != nil {
-			return err
-		} else {
-			resources = append(resources, resource)
+		endpoint, err := d.NewEndpoint(
+			stream.Context(),
+			open.Materialization.EndpointSpecJson,
+		)
+		if err != nil {
+			return nil, opened, fmt.Errorf("building endpoint: %w", err)
 		}
-	}
 
-	if err = stream.Send(&pm.TransactionResponse{
-		Opened: &pm.TransactionResponse_Opened{RuntimeCheckpoint: fence.Checkpoint()}}); err != nil {
-		return fmt.Errorf("sending Opened: %w", err)
-	}
+		// Verify the opened materialization has been applied to the database,
+		// and that the versions match.
+		if version, spec, err := endpoint.LoadSpec(stream.Context(), open.Materialization.Materialization); err != nil {
+			return nil, opened, fmt.Errorf("loading materialization spec: %w", err)
+		} else if spec == nil {
+			return nil, opened, fmt.Errorf("materialization has not been applied")
+		} else if version != open.Version {
+			return nil, opened, fmt.Errorf(
+				"applied and current materializations are different versions (applied: %s vs current: %s)",
+				version, open.Version)
+		}
 
-	return d.RunTransactions(
-		stream,
-		endpoint,
-		open.Open.Materialization,
-		fence,
-		resources,
-	)
+		fence, err := endpoint.NewFence(
+			stream.Context(),
+			open.Materialization.Materialization,
+			open.KeyBegin,
+			open.KeyEnd,
+		)
+		if err != nil {
+			return nil, opened, fmt.Errorf("installing fence: %w", err)
+		}
+		opened.RuntimeCheckpoint = fence.Checkpoint()
+
+		// Parse resource specifications.
+		var resources []Resource
+		for _, spec := range open.Materialization.Bindings {
+			if resource, err := parseResource(
+				d.NewResource(endpoint),
+				spec.ResourceSpecJson,
+				&spec.Collection,
+			); err != nil {
+				return nil, opened, err
+			} else {
+				resources = append(resources, resource)
+			}
+		}
+
+		transactor, err := d.NewTransactor(
+			stream.Context(), endpoint, open.Materialization, fence, resources)
+		if err != nil {
+			return nil, opened, err
+		}
+
+		return transactor, opened, nil
+	})
 }
 
 // loadConstraints retrieves an existing binding spec under the given
