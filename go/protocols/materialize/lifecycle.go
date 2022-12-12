@@ -476,14 +476,14 @@ func WriteFlushed(stream TransactionResponseTx, response *TransactionResponse) e
 func WriteStartedCommit(
 	stream TransactionResponseTx,
 	response *TransactionResponse,
-	checkpoint pf.DriverCheckpoint,
+	checkpoint *pf.DriverCheckpoint,
 ) error {
 	if response.Flushed == nil {
 		panic(fmt.Sprintf("expected prior response is Flushed, got %#v", response))
 	}
 	*response = TransactionResponse{
 		StartedCommit: &TransactionResponse_StartedCommit{
-			DriverCheckpoint: &checkpoint,
+			DriverCheckpoint: checkpoint,
 		},
 	}
 	if err := stream.Send(response); err != nil {

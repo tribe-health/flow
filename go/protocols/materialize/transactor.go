@@ -60,7 +60,7 @@ type Transactor interface {
 	// but then the runtime or this Transactor may crash before the application
 	// is able to complete. For this reason, on startup a Transactor must take
 	// care to (re-)apply a staged update encoded in the opened DriverCheckpoint.
-	StartCommit(_ context.Context, runtimeCheckpoint []byte) (pf.DriverCheckpoint, pf.OpFuture, error)
+	StartCommit(_ context.Context, runtimeCheckpoint []byte) (*pf.DriverCheckpoint, pf.OpFuture, error)
 	// RuntimeCommitted is called after StartCommit, upon the runtime completing
 	// its commit to its recovery log.
 	//
@@ -76,14 +76,14 @@ type Transactor interface {
 // over the established stream against a Driver.
 func RunTransactions(
 	stream Driver_TransactionsServer,
-	newTransactor func(TransactionRequest_Open) (Transactor, TransactionResponse_Opened, error),
+	newTransactor func(context.Context, TransactionRequest_Open) (Transactor, *TransactionResponse_Opened, error),
 ) (_err error) {
 
 	var rxRequest, err = ReadOpen(stream)
 	if err != nil {
 		return err
 	}
-	transactor, opened, err := newTransactor(*rxRequest.Open)
+	transactor, opened, err := newTransactor(stream.Context(), *rxRequest.Open)
 	if err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func RunTransactions(
 		transactor.Destroy()
 	}()
 
-	txResponse, err := WriteOpened(stream, &opened)
+	txResponse, err := WriteOpened(stream, opened)
 	if err != nil {
 		return err
 	}
@@ -261,7 +261,7 @@ func RunTransactions(
 		logrus.WithFields(logrus.Fields{"round": round, "stored": storeIt.total}).Debug("Store finished")
 
 		var runtimeCheckpoint []byte
-		var driverCheckpoint pf.DriverCheckpoint
+		var driverCheckpoint *pf.DriverCheckpoint
 
 		if runtimeCheckpoint, err = ReadStartCommit(&rxRequest); err != nil {
 			return err
